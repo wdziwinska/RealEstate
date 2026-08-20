@@ -1,76 +1,212 @@
 from __future__ import annotations
 
-from app.db.chroma import ChromaStore
-from app.models import (
-    AgentFinding,
-    FindingSeverity,
-    GraphState,
-    PropertyCondition,
-    WorkflowStatus,
-)
-from app.tools.cost_tracker import CostTracker
-from app.tools.scraper import Scraper
-from app.tools.web_search import WebSearchTool
+import os
+from typing import List
+
+from dotenv import load_dotenv
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
+from langchain_openai import ChatOpenAI
+
+from app.models import GraphState
+
+
+load_dotenv()
 
 
 class Researcher:
+    """
+    Agent responsible for discovering real-estate offers
+    using Web Search MCP tools.
+    """
+
     name = "Researcher"
 
     def __init__(
         self,
-        web_search: WebSearchTool,
-        scraper: Scraper,
-        cost_tracker: CostTracker,
-        chroma_store: ChromaStore | None = None,
-    ) -> None:
-        self.web_search = web_search
-        self.scraper = scraper
-        self.cost_tracker = cost_tracker
-        self.chroma_store = chroma_store
+        tools: List[BaseTool],
+        llm: BaseChatModel | None = None,
+    ):
+        self.tools = tools
 
-    def run(self, state: GraphState) -> GraphState:
-        try:
-            offers = self.web_search.search_offers(state.criteria, max_results=10)
-            enriched = []
-            for offer in offers:
-                scraped = self.scraper.scrape_listing(offer.link, offer.description)
-                if offer.year_built is None:
-                    offer.year_built = scraped["year_built"]  # type: ignore[assignment]
-                if offer.condition == PropertyCondition.UNKNOWN:
-                    offer.condition = scraped["condition"]  # type: ignore[assignment]
-                if offer.year_built is None:
-                    warning = "Year built unknown; queued for image/text follow-up."
-                    offer.warnings.append(warning)
-                    state.findings.append(
-                        AgentFinding(
-                            agent_name=self.name,
-                            offer_id=offer.id,
-                            severity=FindingSeverity.WARNING,
-                            message=warning,
-                        )
-                    )
-                if self.chroma_store:
-                    self.chroma_store.upsert_offer(offer)
-                enriched.append(offer)
+        self.llm = llm or ChatOpenAI(
+            model=os.getenv(
+                "LOCAL_LLM_MODEL",
+                "qwen3:30b",
+            ),
+            base_url=os.getenv(
+                "LOCAL_LLM_BASE_URL",
+            ),
+            api_key=os.getenv(
+                "LOCAL_LLM_API_KEY",
+                "dummy",
+            ),
+            temperature=0,
+            max_retries=1,
+        )
 
-            state.offers = enriched
-            state.status = WorkflowStatus.DISCOVERY_DONE
-            usage = self.cost_tracker.record(
-                self.name,
-                prompt_tokens=sum(len(offer.description.split()) for offer in enriched) * 2,
-                completion_tokens=max(80, len(enriched) * 45),
-            )
-            state.token_costs[self.name] = usage
-            state.api_call_count += 1
-            if not enriched:
-                state.findings.append(
-                    AgentFinding(
-                        agent_name=self.name,
-                        severity=FindingSeverity.WARNING,
-                        message="No offers found for current criteria.",
-                    )
+        self.agent = self.llm.bind_tools(self.tools)
+
+    def _build_query_from_criteria(self, criteria) -> str:
+        """
+        Build a natural-language search query from UserCriteria
+        when raw_query was not provided.
+        """
+
+        # Pydantic v2
+        if hasattr(criteria, "model_dump"):
+            data = criteria.model_dump()
+        else:
+            data = vars(criteria)
+
+        # raw_query is handled separately
+        data.pop("raw_query", None)
+
+        parts: list[str] = []
+
+        for key, value in data.items():
+            if value is None:
+                continue
+
+            if value == "":
+                continue
+
+            if isinstance(value, bool):
+                if not value:
+                    continue
+
+                parts.append(
+                    f"{key.replace('_', ' ')}: yes"
                 )
-        except Exception as exc:
-            state.errors.append(f"{self.name}: {exc}")
-            state.status = WorkflowStatus.ERROR
+                continue
+
+            if isinstance(value, (list, tuple, set)):
+                if not value:
+                    continue
+
+                value = ", ".join(str(item) for item in value)
+
+            parts.append(
+                f"{key.replace('_', ' ')}: {value}"
+            )
+
+        if not parts:
+            return (
+                "Find residential real estate offers in Warsaw "
+                "and within 30 km of Warsaw."
+            )
+
+        return (
+            "Find residential real estate offers in Warsaw "
+            "and within 30 km of Warsaw matching these criteria: "
+            + "; ".join(parts)
+        )
+
+    def _get_search_query(self, state: GraphState) -> str:
+        """
+        Prefer original user query, but fall back to structured criteria.
+        """
+
+        raw_query = getattr(
+            state.criteria,
+            "raw_query",
+            None,
+        )
+
+        if raw_query and raw_query.strip():
+            return raw_query.strip()
+
+        return self._build_query_from_criteria(
+            state.criteria
+        )
+
+    async def run(self, state: GraphState) -> GraphState:
+        search_query = self._get_search_query(state)
+
+        print(
+            "Researcher search query:",
+            repr(search_query),
+        )
+
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are the Researcher agent in a real-estate analysis system.\n\n"
+                    "Your task is to DISCOVER real property listings.\n"
+                    "Do not attempt to validate rail distance, travel time, "
+                    "legal status or environmental conditions during discovery. "
+                    "Those checks are performed by other agents.\n\n"
+
+                    "Use get-web-search-summaries to find listings matching only "
+                    "basic property criteria such as:\n"
+                    "- property type\n"
+                    "- maximum price\n"
+                    "- general location\n"
+                    "- minimum area if specified\n\n"
+
+                    "For Warsaw + surrounding area, search broadly. "
+                    "Do not put distance-to-PKP requirements into the search query.\n\n"
+
+                    "Prefer search queries resembling normal Google searches, e.g.:\n"
+                    "'dom na sprzedaż Warszawa do 1500000'\n"
+                    "'dom na sprzedaż Piaseczno do 1500000'\n"
+                    "'dom na sprzedaż Legionowo do 1500000'\n\n"
+
+                    "You MUST use web-search tools."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    "Find property offers matching the following "
+                    "criteria:\n\n"
+                    f"{search_query}"
+                )
+            ),
+        ]
+
+        response = self.agent.invoke(messages)
+
+        print(
+            "Researcher agent response:",
+            response,
+        )
+
+        print(
+            "Researcher tool calls:",
+            response.tool_calls,
+        )
+
+        if response.tool_calls:
+            tool_map = {
+                tool.name: tool
+                for tool in self.tools
+            }
+
+            for call in response.tool_calls:
+                tool_name = call["name"]
+                tool_args = call["args"]
+
+                tool = tool_map.get(tool_name)
+
+                if tool is None:
+                    print(
+                        f"Unknown tool requested by LLM: {tool_name}"
+                    )
+                    continue
+
+                print(
+                    f"Executing MCP tool: {tool_name}"
+                )
+                print(
+                    f"Tool arguments: {tool_args}"
+                )
+
+                result = await tool.ainvoke(tool_args)
+
+                print(
+                    "Tool result:",
+                    result,
+                )
+
         return state
