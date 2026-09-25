@@ -70,6 +70,29 @@ WARSAW_DISTRICTS = {
     "wawer": "Wawer",
 }
 
+CATEGORY_URL_MARKERS = (
+    "/pl/wyniki/",
+    "/domy,sprzedaz",
+    "/lista-ofert/",
+    "/domy/oferta-sprzedaz/",
+    "/nieruchomosci/domy/",
+    "/domy/otwock",
+    "/domy,",
+    "/dom/sprzedaz",
+)
+
+CATEGORY_TEXT_MARKERS = (
+    "aktualne ogloszenia",
+    "sprawdz ",
+    "zobacz ",
+    "ogloszen - domy",
+    "ofert dom",
+    "ofert domow",
+    "sredniej cenie",
+    "kategoria domy",
+    "ponizej znajdziesz aktualna oferte",
+)
+
 POLISH_TRANSLATION = str.maketrans(
     {
         "ą": "a",
@@ -228,6 +251,10 @@ class Researcher:
                     "For Warsaw + surrounding area, search broadly. "
                     "Do not put distance-to-PKP requirements into the search query.\n\n"
 
+                    "Return or search for individual listing pages only. "
+                    "Avoid portal result pages, category pages, aggregate search pages, "
+                    "and pages that only list many offers.\n\n"
+
                     "Prefer search queries resembling normal Google searches, e.g.:\n"
                     "'dom na sprzedaż Warszawa do 1500000'\n"
                     "'dom na sprzedaż Piaseczno do 1500000'\n"
@@ -364,6 +391,10 @@ class Researcher:
             description = self._clean_text(match.group("description"))
             combined_text = " ".join([title, description, tool_query, link])
 
+            if self._looks_like_category_page(combined_text):
+                logger.info("Skipping non-listing search result: %s", link)
+                continue
+
             price_pln, price_warnings = self._extract_price_pln(combined_text, criteria)
             area_m2, area_warnings = self._extract_area_m2(combined_text, criteria, price_pln)
             municipality, district = self._infer_location(combined_text, criteria)
@@ -375,8 +406,6 @@ class Researcher:
                 *price_warnings,
                 *area_warnings,
             ]
-            if self._looks_like_category_page(combined_text):
-                warnings.append("Search result looks like a portal/category page, not a single offer.")
 
             offers.append(
                 PropertyOffer(
@@ -490,15 +519,9 @@ class Researcher:
 
     def _looks_like_category_page(self, text: str) -> bool:
         normalized = self._normalize(text)
-        category_markers = (
-            "ofert",
-            "ogloszen",
-            "aktualne ogloszenia",
-            "kategoria",
-            "wyniki sprzedaz",
-            "lista ofert",
+        return any(marker in normalized for marker in CATEGORY_URL_MARKERS) or any(
+            marker in normalized for marker in CATEGORY_TEXT_MARKERS
         )
-        return any(marker in normalized for marker in category_markers)
 
     def _address_from_location(self, municipality: str, district: str | None) -> str:
         if district:

@@ -108,12 +108,13 @@ def offer_rows(state: GraphState, shortlist_only: bool = False) -> list[dict[str
         rows.append(
             {
                 "id": offer.id,
+                "link": offer.link,
                 "tytuł": offer.title,
                 "gmina/dzielnica": f"{offer.municipality} {offer.district or ''}".strip(),
                 "cena": offer.price_pln,
                 "m2": offer.area_m2,
                 "PLN/m2": offer.price_per_m2,
-                "rok": offer.year_built or "Unknown",
+                "rok": str(offer.year_built) if offer.year_built is not None else "Unknown",
                 "stan": offer.condition.value,
                 "PKP km": logistics.station_distance_km if logistics else None,
                 "stacja": logistics.nearest_station if logistics else None,
@@ -124,6 +125,16 @@ def offer_rows(state: GraphState, shortlist_only: bool = False) -> list[dict[str
             }
         )
     return rows
+
+
+OFFER_LINK_COLUMN = {
+    "link": st.column_config.LinkColumn(
+        "oferta",
+        help="Otwiera źródłową stronę oferty.",
+        display_text="Otwórz",
+        validate=r"^https?://.+",
+    )
+}
 
 
 def render_costs(state: GraphState) -> None:
@@ -149,7 +160,7 @@ def render_costs(state: GraphState) -> None:
                 for agent, usage in state.token_costs.items()
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -219,11 +230,21 @@ def main() -> None:
 
     if state.offers:
         st.subheader("Discovery")
-        st.dataframe(offer_rows(state), hide_index=True, use_container_width=True)
+        st.dataframe(
+            offer_rows(state),
+            hide_index=True,
+            width="stretch",
+            column_config=OFFER_LINK_COLUMN,
+        )
 
     if state.shortlist:
         st.subheader("Shortlista po filtrze PKP")
-        st.dataframe(offer_rows(state, shortlist_only=True), hide_index=True, use_container_width=True)
+        st.dataframe(
+            offer_rows(state, shortlist_only=True),
+            hide_index=True,
+            width="stretch",
+            column_config=OFFER_LINK_COLUMN,
+        )
 
     if state.status == WorkflowStatus.HITL_WAITING:
         st.subheader("Checkpoint HITL")
@@ -258,6 +279,7 @@ def main() -> None:
             [
                 {
                     "rank": item.rank,
+                    "link": state.offer_by_id(item.offer_id).link if state.offer_by_id(item.offer_id) else "",
                     "tytuł": item.title,
                     "score": item.score,
                     "cena": item.price_pln,
@@ -267,7 +289,8 @@ def main() -> None:
                 for item in state.final_ranking
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
+            column_config=OFFER_LINK_COLUMN,
         )
         for item in state.final_ranking:
             with st.expander(f"#{item.rank} {item.title}"):
