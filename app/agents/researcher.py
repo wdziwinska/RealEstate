@@ -6,6 +6,7 @@ import os
 import re
 import unicodedata
 from typing import Any, List
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
@@ -39,6 +40,11 @@ MILLION_PRICE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 AREA_PATTERN = re.compile(r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m²|m\^2)", re.IGNORECASE)
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\]\)\"']+")
+
+MAX_CATEGORY_EXPANSIONS = 3
+MAX_LISTING_LINKS_PER_CATEGORY = 6
 
 MUNICIPALITY_CANDIDATES = (
     "Ozarow Mazowiecki",
@@ -91,6 +97,19 @@ CATEGORY_TEXT_MARKERS = (
     "sredniej cenie",
     "kategoria domy",
     "ponizej znajdziesz aktualna oferte",
+)
+
+DETAIL_URL_MARKERS = (
+    "/pl/oferta/",
+    "/d/oferta/",
+    "/oferta/",
+    "/oferty/",
+    "/ogloszenie/",
+    "/ogloszenia/",
+    "/o/",
+    "/ob/",
+    "/dom-",
+    "/mieszkanie-",
 )
 
 POLISH_TRANSLATION = str.maketrans(
@@ -318,10 +337,11 @@ class Researcher:
                 )
 
                 tool_query = self._query_from_tool_args(tool_args, fallback=search_query)
-                offers = self._offers_from_tool_result(
+                offers = await self._offers_from_tool_result(
                     result,
                     state.criteria,
                     tool_query,
+                    tool_map,
                 )
                 added_count = self._add_unique_offers(state, offers)
                 logger.info("Researcher stored %d new offers from %s", added_count, tool_name)
@@ -342,16 +362,33 @@ class Researcher:
 
         return fallback
 
-    def _offers_from_tool_result(
+    async def _offers_from_tool_result(
         self,
         result: Any,
         criteria: UserCriteria,
         tool_query: str,
+        tool_map: dict[str, BaseTool],
     ) -> list[PropertyOffer]:
         offers: list[PropertyOffer] = []
+        category_results: list[dict[str, str]] = []
         for text in self._result_text_blocks(result):
-            offers.extend(self._offers_from_search_summary_text(text, criteria, tool_query))
-        return offers
+            text_offers, text_categories = self._offers_and_categories_from_search_summary_text(
+                text,
+                criteria,
+                tool_query,
+            )
+            offers.extend(text_offers)
+            category_results.extend(text_categories)
+
+        offers.extend(
+            await self._expand_category_results(
+                category_results,
+                tool_map,
+                criteria,
+                tool_query,
+            )
+        )
+        return self._dedupe_offers(offers)
 
     def _result_text_blocks(self, result: Any) -> list[str]:
         if isinstance(result, str):
@@ -383,50 +420,270 @@ class Researcher:
         criteria: UserCriteria,
         tool_query: str,
     ) -> list[PropertyOffer]:
+        offers, _ = self._offers_and_categories_from_search_summary_text(
+            text,
+            criteria,
+            tool_query,
+        )
+        return offers
+
+    def _offers_and_categories_from_search_summary_text(
+        self,
+        text: str,
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> tuple[list[PropertyOffer], list[dict[str, str]]]:
         offers: list[PropertyOffer] = []
+        category_results: list[dict[str, str]] = []
 
         for match in SEARCH_RESULT_PATTERN.finditer(text):
             title = self._clean_text(match.group("title"))
             link = match.group("link").strip()
             description = self._clean_text(match.group("description"))
             combined_text = " ".join([title, description, tool_query, link])
+            result = {
+                "title": title,
+                "link": link,
+                "description": description,
+            }
 
             if self._looks_like_category_page(combined_text):
                 logger.info("Skipping non-listing search result: %s", link)
+                category_results.append(result)
                 continue
 
-            price_pln, price_warnings = self._extract_price_pln(combined_text, criteria)
-            area_m2, area_warnings = self._extract_area_m2(combined_text, criteria, price_pln)
-            municipality, district = self._infer_location(combined_text, criteria)
-            market_type = self._infer_market_type(combined_text, criteria)
-
-            scraped = self.scraper.scrape_listing(link, description)
-            warnings = [
-                "Search result summary, not a full listing; verify source page before decision.",
-                *price_warnings,
-                *area_warnings,
-            ]
-
-            offers.append(
-                PropertyOffer(
-                    id=self._stable_offer_id(link),
-                    source="web_search_mcp",
-                    title=title,
-                    price_pln=price_pln,
-                    area_m2=area_m2,
-                    address=self._address_from_location(municipality, district),
-                    municipality=municipality,
-                    district=district,
-                    link=link,
-                    description=description,
-                    year_built=scraped["year_built"],
-                    condition=scraped["condition"],
-                    market_type=market_type,
-                    warnings=warnings,
-                )
+            offer = self._offer_from_listing_result(
+                result,
+                criteria,
+                tool_query,
+                source="web_search_mcp",
+                base_warnings=["Search result summary; verify source page before decision."],
             )
+            if offer is not None:
+                offers.append(offer)
 
-        return offers
+        return offers, category_results
+
+    async def _expand_category_results(
+        self,
+        category_results: list[dict[str, str]],
+        tool_map: dict[str, BaseTool],
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> list[PropertyOffer]:
+        offers: list[PropertyOffer] = []
+        page_tool = tool_map.get("get-single-web-page-content")
+        search_tool = tool_map.get("get-web-search-summaries")
+
+        for category in category_results[:MAX_CATEGORY_EXPANSIONS]:
+            category_link = category["link"]
+
+            if page_tool is not None:
+                try:
+                    page_result = await page_tool.ainvoke(
+                        {
+                            "url": category_link,
+                            "maxContentLength": 15000,
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to expand listing page %s: %s", category_link, exc)
+                else:
+                    for text in self._result_text_blocks(page_result):
+                        offers.extend(
+                            self._offers_from_page_content_text(
+                                text,
+                                category,
+                                criteria,
+                                tool_query,
+                            )
+                        )
+
+            if search_tool is not None:
+                followup_query = self._listing_detail_search_query(
+                    category,
+                    criteria,
+                    tool_query,
+                )
+                try:
+                    search_result = await search_tool.ainvoke(
+                        {
+                            "query": followup_query,
+                            "limit": 10,
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to search listing details for %s: %s", category_link, exc)
+                else:
+                    for text in self._result_text_blocks(search_result):
+                        offers.extend(
+                            self._offers_from_search_summary_text(
+                                text,
+                                criteria,
+                                followup_query,
+                            )
+                        )
+
+        return self._dedupe_offers(offers)
+
+    def _offers_from_page_content_text(
+        self,
+        text: str,
+        category_result: dict[str, str],
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> list[PropertyOffer]:
+        offers: list[PropertyOffer] = []
+
+        for link in self._extract_urls(text):
+            if len(offers) >= MAX_LISTING_LINKS_PER_CATEGORY:
+                break
+
+            context = self._context_for_url(text, link)
+            result = {
+                "title": self._title_from_context(context, link, category_result["title"]),
+                "link": link,
+                "description": self._clean_text(context or category_result["description"]),
+            }
+            offer = self._offer_from_listing_result(
+                result,
+                criteria,
+                tool_query,
+                source="web_search_mcp_expanded",
+                base_warnings=[
+                    "Offer link extracted from an aggregate page; verify source page before decision."
+                ],
+            )
+            if offer is not None:
+                offers.append(offer)
+
+        return self._dedupe_offers(offers)
+
+    def _offer_from_listing_result(
+        self,
+        result: dict[str, str],
+        criteria: UserCriteria,
+        tool_query: str,
+        source: str,
+        base_warnings: list[str],
+    ) -> PropertyOffer | None:
+        title = self._clean_text(result["title"])
+        link = self._clean_url(result["link"])
+        description = self._clean_text(result["description"])
+        combined_text = " ".join([title, description, tool_query, link])
+
+        if not self._is_listing_detail_page(link, combined_text):
+            logger.info("Skipping non-detail listing result: %s", link)
+            return None
+
+        price_pln, price_warnings = self._extract_price_pln(combined_text, criteria)
+        area_m2, area_warnings = self._extract_area_m2(combined_text, criteria, price_pln)
+        municipality, district = self._infer_location(combined_text, criteria)
+        market_type = self._infer_market_type(combined_text, criteria)
+        scraped = self.scraper.scrape_listing(link, description)
+
+        return PropertyOffer(
+            id=self._stable_offer_id(link),
+            source=source,
+            title=title or self._title_from_link(link),
+            price_pln=price_pln,
+            area_m2=area_m2,
+            address=self._address_from_location(municipality, district),
+            municipality=municipality,
+            district=district,
+            link=link,
+            description=description,
+            year_built=scraped["year_built"],
+            condition=scraped["condition"],
+            market_type=market_type,
+            warnings=[*base_warnings, *price_warnings, *area_warnings],
+        )
+
+    def _listing_detail_search_query(
+        self,
+        category_result: dict[str, str],
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> str:
+        host = urlparse(category_result["link"]).netloc.lower().removeprefix("www.")
+        combined_text = " ".join([category_result["title"], category_result["description"], tool_query])
+        municipality, _ = self._infer_location(combined_text, criteria)
+        site_query = f"site:{host}"
+
+        if "otodom" in host:
+            site_query = "site:otodom.pl/pl/oferta"
+        elif "olx" in host:
+            site_query = "site:olx.pl/d/oferta"
+        elif "morizon" in host:
+            site_query = "site:morizon.pl/oferta"
+        elif "adresowo" in host:
+            site_query = "site:adresowo.pl/o/"
+
+        return (
+            f"{site_query} {criteria.property_type} {municipality} "
+            f"do {criteria.max_price_pln} sprzedaz oferta"
+        )
+
+    def _extract_urls(self, text: str) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for match in URL_PATTERN.finditer(text):
+            url = self._clean_url(match.group(0))
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    def _context_for_url(self, text: str, url: str) -> str:
+        index = text.find(url)
+        if index < 0:
+            return ""
+        start = max(0, index - 700)
+        end = min(len(text), index + len(url) + 700)
+        return text[start:end]
+
+    def _title_from_context(self, context: str, link: str, fallback: str) -> str:
+        lines = [self._clean_text(line) for line in context.splitlines() if self._clean_text(line)]
+        for line in reversed(lines):
+            if link in line:
+                continue
+            if len(line) > 12:
+                return line[:160]
+        return fallback or self._title_from_link(link)
+
+    def _is_listing_detail_page(self, link: str, text: str) -> bool:
+        normalized_link = self._normalize(link)
+        normalized_text = self._normalize(text)
+
+        if self._looks_like_category_page(" ".join([link, text])):
+            return False
+
+        if any(marker in normalized_link for marker in DETAIL_URL_MARKERS):
+            return True
+
+        has_price = bool(PRICE_PATTERN.search(text)) or bool(MILLION_PRICE_PATTERN.search(normalized_text))
+        has_area = bool(AREA_PATTERN.search(text))
+        generic_title = any(
+            marker in normalized_text
+            for marker in (
+                "domy na sprzedaz",
+                "mieszkania na sprzedaz",
+                "oferty nieruchomosci",
+                "ogloszenia nieruchomosci",
+            )
+        )
+        return has_price and has_area and not generic_title
+
+    def _dedupe_offers(self, offers: list[PropertyOffer]) -> list[PropertyOffer]:
+        unique: list[PropertyOffer] = []
+        seen_links: set[str] = set()
+        for offer in offers:
+            if offer.link in seen_links:
+                continue
+            seen_links.add(offer.link)
+            unique.append(offer)
+        return unique
 
     def _add_unique_offers(self, state: GraphState, offers: list[PropertyOffer]) -> int:
         existing_links = {offer.link for offer in state.offers}
@@ -452,6 +709,13 @@ class Researcher:
 
         price_matches = [self._parse_number(match.group("amount")) for match in PRICE_PATTERN.finditer(text)]
         price_matches = [price for price in price_matches if price is not None and price > 0]
+
+        if not price_matches:
+            price_matches = [
+                self._parse_number(match.group("amount"))
+                for match in PRICE_PATTERN.finditer(normalized)
+            ]
+            price_matches = [price for price in price_matches if price is not None and price > 0]
 
         if not price_matches:
             for match in MILLION_PRICE_PATTERN.finditer(normalized):
@@ -531,6 +795,17 @@ class Researcher:
     def _stable_offer_id(self, link: str) -> str:
         digest = hashlib.sha1(link.encode("utf-8")).hexdigest()[:12]
         return f"web-{digest}"
+
+    def _clean_url(self, value: str) -> str:
+        return value.strip().rstrip(".,;:)]}")
+
+    def _title_from_link(self, link: str) -> str:
+        path = urlparse(link).path.strip("/")
+        if not path:
+            return urlparse(link).netloc
+        slug = path.split("/")[-1]
+        slug = re.sub(r"[-_]+", " ", slug)
+        return self._clean_text(slug).title()
 
     def _clean_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", value).strip()
