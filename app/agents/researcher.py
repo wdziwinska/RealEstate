@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
-from typing import List
+import re
+import unicodedata
+from typing import Any, List
 
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
@@ -9,10 +13,85 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
-from app.models import GraphState
+from app.models import GraphState, MarketType, PropertyOffer, UserCriteria, WorkflowStatus
+from app.tools.scraper import Scraper
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+SEARCH_RESULT_PATTERN = re.compile(
+    r"\*\*\s*(?P<rank>\d+)\.\s*(?P<title>.+?)\s*\*\*\s*"
+    r"\nURL:\s*(?P<link>\S+)\s*"
+    r"\nDescription:\s*(?P<description>.*?)(?=\n\n---|\n\n\*\*\s*\d+\.|\Z)",
+    re.DOTALL,
+)
+
+PRICE_PATTERN = re.compile(
+    r"(?P<amount>\d{1,3}(?:[\s\u00a0]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)\s*"
+    r"(?P<currency>zł|zl|pln)",
+    re.IGNORECASE,
+)
+MILLION_PRICE_PATTERN = re.compile(
+    r"(?P<amount>\d+(?:[,.]\d+)?)\s*(?:mln|milion(?:a|y|ow)?)\s*(?:zł|zl|pln)?",
+    re.IGNORECASE,
+)
+AREA_PATTERN = re.compile(r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m²|m\^2)", re.IGNORECASE)
+
+MUNICIPALITY_CANDIDATES = (
+    "Ozarow Mazowiecki",
+    "Minsk Mazowiecki",
+    "Konstancin-Jeziorna",
+    "Grodzisk Mazowiecki",
+    "Warszawa",
+    "Rembertow",
+    "Sulejowek",
+    "Piaseczno",
+    "Legionowo",
+    "Konstancin",
+    "Otwock",
+    "Jozefow",
+    "Karczew",
+    "Pruszkow",
+    "Milanowek",
+    "Marki",
+    "Zabki",
+    "Wolomin",
+    "Kobylka",
+    "Lesznowola",
+    "Nadarzyn",
+    "Blonie",
+)
+
+WARSAW_DISTRICTS = {
+    "rembertow": "Rembertow",
+    "wawer": "Wawer",
+}
+
+POLISH_TRANSLATION = str.maketrans(
+    {
+        "ą": "a",
+        "ć": "c",
+        "ę": "e",
+        "ł": "l",
+        "ń": "n",
+        "ó": "o",
+        "ś": "s",
+        "ż": "z",
+        "ź": "z",
+        "Ą": "A",
+        "Ć": "C",
+        "Ę": "E",
+        "Ł": "L",
+        "Ń": "N",
+        "Ó": "O",
+        "Ś": "S",
+        "Ż": "Z",
+        "Ź": "Z",
+    }
+)
 
 
 class Researcher:
@@ -29,6 +108,7 @@ class Researcher:
         llm: BaseChatModel | None = None,
     ):
         self.tools = tools
+        self.scraper = Scraper()
 
         self.llm = llm or ChatOpenAI(
             model=os.getenv(
@@ -124,8 +204,8 @@ class Researcher:
     async def run(self, state: GraphState) -> GraphState:
         search_query = self._get_search_query(state)
 
-        print(
-            "Researcher search query:",
+        logger.info(
+            "Researcher search query: %s",
             repr(search_query),
         )
 
@@ -167,13 +247,13 @@ class Researcher:
 
         response = self.agent.invoke(messages)
 
-        print(
-            "Researcher agent response:",
+        logger.info(
+            "Researcher agent response: %s",
             response,
         )
 
-        print(
-            "Researcher tool calls:",
+        logger.info(
+            "Researcher tool calls: %s",
             response.tool_calls,
         )
 
@@ -188,25 +268,260 @@ class Researcher:
                 tool_args = call["args"]
 
                 tool = tool_map.get(tool_name)
+                logger.info("Tool requested by LLM: %s", tool_name)
 
                 if tool is None:
-                    print(
+                    logger.error(
                         f"Unknown tool requested by LLM: {tool_name}"
                     )
                     continue
 
-                print(
+                logger.info(
                     f"Executing MCP tool: {tool_name}"
                 )
-                print(
+                logger.info(
                     f"Tool arguments: {tool_args}"
                 )
 
                 result = await tool.ainvoke(tool_args)
 
-                print(
-                    "Tool result:",
+                logger.info(
+                    "Tool result: %s",
                     result,
                 )
 
+                tool_query = self._query_from_tool_args(tool_args, fallback=search_query)
+                offers = self._offers_from_tool_result(
+                    result,
+                    state.criteria,
+                    tool_query,
+                )
+                added_count = self._add_unique_offers(state, offers)
+                logger.info("Researcher stored %d new offers from %s", added_count, tool_name)
+
+        if state.offers:
+            state.status = WorkflowStatus.DISCOVERY_DONE
+
         return state
+
+    def _query_from_tool_args(self, tool_args: Any, fallback: str) -> str:
+        if not isinstance(tool_args, dict):
+            return fallback
+
+        for key in ("query", "search_query", "q"):
+            value = tool_args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return fallback
+
+    def _offers_from_tool_result(
+        self,
+        result: Any,
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> list[PropertyOffer]:
+        offers: list[PropertyOffer] = []
+        for text in self._result_text_blocks(result):
+            offers.extend(self._offers_from_search_summary_text(text, criteria, tool_query))
+        return offers
+
+    def _result_text_blocks(self, result: Any) -> list[str]:
+        if isinstance(result, str):
+            return [result]
+
+        if isinstance(result, dict):
+            text = result.get("text")
+            return [text] if isinstance(text, str) and text.strip() else []
+
+        if isinstance(result, list):
+            texts: list[str] = []
+            for item in result:
+                texts.extend(self._result_text_blocks(item))
+            return texts
+
+        text = getattr(result, "text", None)
+        if isinstance(text, str) and text.strip():
+            return [text]
+
+        content = getattr(result, "content", None)
+        if content is not None:
+            return self._result_text_blocks(content)
+
+        return []
+
+    def _offers_from_search_summary_text(
+        self,
+        text: str,
+        criteria: UserCriteria,
+        tool_query: str,
+    ) -> list[PropertyOffer]:
+        offers: list[PropertyOffer] = []
+
+        for match in SEARCH_RESULT_PATTERN.finditer(text):
+            title = self._clean_text(match.group("title"))
+            link = match.group("link").strip()
+            description = self._clean_text(match.group("description"))
+            combined_text = " ".join([title, description, tool_query, link])
+
+            price_pln, price_warnings = self._extract_price_pln(combined_text, criteria)
+            area_m2, area_warnings = self._extract_area_m2(combined_text, criteria, price_pln)
+            municipality, district = self._infer_location(combined_text, criteria)
+            market_type = self._infer_market_type(combined_text, criteria)
+
+            scraped = self.scraper.scrape_listing(link, description)
+            warnings = [
+                "Search result summary, not a full listing; verify source page before decision.",
+                *price_warnings,
+                *area_warnings,
+            ]
+            if self._looks_like_category_page(combined_text):
+                warnings.append("Search result looks like a portal/category page, not a single offer.")
+
+            offers.append(
+                PropertyOffer(
+                    id=self._stable_offer_id(link),
+                    source="web_search_mcp",
+                    title=title,
+                    price_pln=price_pln,
+                    area_m2=area_m2,
+                    address=self._address_from_location(municipality, district),
+                    municipality=municipality,
+                    district=district,
+                    link=link,
+                    description=description,
+                    year_built=scraped["year_built"],
+                    condition=scraped["condition"],
+                    market_type=market_type,
+                    warnings=warnings,
+                )
+            )
+
+        return offers
+
+    def _add_unique_offers(self, state: GraphState, offers: list[PropertyOffer]) -> int:
+        existing_links = {offer.link for offer in state.offers}
+        added_count = 0
+
+        for offer in offers:
+            if offer.link in existing_links:
+                continue
+
+            state.offers.append(offer)
+            existing_links.add(offer.link)
+            added_count += 1
+
+        return added_count
+
+    def _extract_price_pln(
+        self,
+        text: str,
+        criteria: UserCriteria,
+    ) -> tuple[int, list[str]]:
+        warnings: list[str] = []
+        normalized = self._normalize(text)
+
+        price_matches = [self._parse_number(match.group("amount")) for match in PRICE_PATTERN.finditer(text)]
+        price_matches = [price for price in price_matches if price is not None and price > 0]
+
+        if not price_matches:
+            for match in MILLION_PRICE_PATTERN.finditer(normalized):
+                raw_value = match.group("amount").replace(",", ".")
+                try:
+                    price_matches.append(int(float(raw_value) * 1_000_000))
+                except ValueError:
+                    continue
+
+        if price_matches:
+            if "sredniej cenie" in normalized or "ceny od" in normalized:
+                warnings.append("Price comes from a search snippet/category summary; verify exact price.")
+            return int(price_matches[0]), warnings
+
+        warnings.append("Price missing in search summary; using criteria max price as fallback.")
+        return int(criteria.max_price_pln), warnings
+
+    def _extract_area_m2(
+        self,
+        text: str,
+        criteria: UserCriteria,
+        price_pln: int,
+    ) -> tuple[float, list[str]]:
+        for match in AREA_PATTERN.finditer(text):
+            raw_value = match.group("area").replace(",", ".")
+            try:
+                area = float(raw_value)
+            except ValueError:
+                continue
+
+            if area > 0:
+                return area, []
+
+        fallback_area = criteria.min_area_m2 or max(60.0, min(280.0, round(price_pln / 10_000, 1)))
+        return fallback_area, ["Area missing in search summary; using estimated fallback."]
+
+    def _infer_location(
+        self,
+        text: str,
+        criteria: UserCriteria,
+    ) -> tuple[str, str | None]:
+        normalized = self._normalize(text)
+
+        for district_key, district_name in WARSAW_DISTRICTS.items():
+            if district_key in normalized:
+                return "Warszawa", district_name
+
+        for candidate in MUNICIPALITY_CANDIDATES:
+            if self._normalize(candidate) in normalized:
+                if candidate in {"Rembertow"}:
+                    return "Warszawa", candidate
+                if candidate == "Konstancin":
+                    return "Konstancin-Jeziorna", None
+                return candidate, None
+
+        return criteria.city or "Warszawa", None
+
+    def _infer_market_type(self, text: str, criteria: UserCriteria) -> MarketType:
+        normalized = self._normalize(text)
+        if "pierwotny" in normalized or "deweloper" in normalized or "nowy dom" in normalized:
+            return MarketType.PRIMARY
+        if "wtorny" in normalized:
+            return MarketType.SECONDARY
+        return criteria.market_type
+
+    def _looks_like_category_page(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        category_markers = (
+            "ofert",
+            "ogloszen",
+            "aktualne ogloszenia",
+            "kategoria",
+            "wyniki sprzedaz",
+            "lista ofert",
+        )
+        return any(marker in normalized for marker in category_markers)
+
+    def _address_from_location(self, municipality: str, district: str | None) -> str:
+        if district:
+            return f"{district}, {municipality}"
+        return municipality
+
+    def _stable_offer_id(self, link: str) -> str:
+        digest = hashlib.sha1(link.encode("utf-8")).hexdigest()[:12]
+        return f"web-{digest}"
+
+    def _clean_text(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip()
+
+    def _normalize(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value.translate(POLISH_TRANSLATION))
+        ascii_value = "".join(char for char in normalized if not unicodedata.combining(char))
+        return ascii_value.lower()
+
+    def _parse_number(self, value: str) -> int | None:
+        normalized = value.replace("\u00a0", " ").strip()
+        if "," in normalized:
+            integer_part, decimal_part = normalized.rsplit(",", 1)
+            if len(decimal_part) <= 2:
+                normalized = integer_part
+        normalized = re.sub(r"\D", "", normalized)
+        return int(normalized) if normalized else None

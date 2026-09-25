@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
+from typing import List
 
 from app.config import Settings
 from app.models import LocationData
-from app.tools.mcp_clients import MCPClientError, MCPGoogleMapsClient
 from app.tools.rate_limiter import RateLimiter
+from langchain_core.tools import BaseTool
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +31,7 @@ class MapsTool:
         "piaseczno": (52.0733, 21.0269),
         "legionowo": (52.4015, 20.9266),
         "konstancin": (52.0938, 21.1176),
+        "otwock": (52.1058, 21.2613),
         "warszawa": (52.2297, 21.0122),
     }
 
@@ -36,6 +41,7 @@ class MapsTool:
         Station("Ożarów Mazowiecki", 52.2113, 20.7977),
         Station("Piaseczno", 52.0757, 21.0159),
         Station("Legionowo", 52.4019, 20.9262),
+        Station("Otwock", 52.1058, 21.2631),
         Station("Warszawa Śródmieście", 52.2289, 21.0035),
         Station("Warszawa Wawer", 52.2207, 21.1588),
     ]
@@ -49,26 +55,36 @@ class MapsTool:
     def __init__(
         self,
         settings: Settings,
-        mcp_client: MCPGoogleMapsClient | None = None,
+        maps_tools: List[BaseTool] | None = None,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.settings = settings
-        self.mcp_client = mcp_client or MCPGoogleMapsClient()
         self.rate_limiter = rate_limiter or RateLimiter(settings.requests_per_minute, settings.max_retries)
+        self.geocode_tool: BaseTool | None = None
+        if maps_tools:
+            # Find the specific tool for geocoding
+            for tool in maps_tools:
+                if "geocode" in tool.name.lower():
+                    self.geocode_tool = tool
+                    logger.info(f"MapsTool initialized with MCP tool: {tool.name}")
+                    break
+        if not self.geocode_tool:
+            logger.info("MapsTool initialized with local mock for geocoding.")
 
     def geocode(self, offer_id: str, address: str, municipality: str, district: str | None) -> LocationData:
-        if not self.mcp_client.enabled:
+        lat, lon, source = None, None, "mock"
+        if self.geocode_tool:
+            try:
+                tool_input = {"address": address}
+                result = self.rate_limiter.run(self.geocode_tool.invoke, tool_input)
+                lat = float(result.get("latitude"))
+                lon = float(result.get("longitude"))
+                source = "mcp"
+            except Exception as e:
+                logger.warning(f"MCP geocode tool failed: {e}. Falling back to mock.")
+                lat, lon = self._mock_coordinates(address, municipality)
+        else:
             lat, lon = self._mock_coordinates(address, municipality)
-            source = "mock"
-            return self._location_data(offer_id, address, municipality, district, lat, lon, source)
-        try:
-            result = self.rate_limiter.run(self.mcp_client.geocode, address)
-            lat = float(result["latitude"])
-            lon = float(result["longitude"])
-            source = "mcp"
-        except (MCPClientError, NotImplementedError, KeyError, ValueError):
-            lat, lon = self._mock_coordinates(address, municipality)
-            source = "mock"
 
         return self._location_data(offer_id, address, municipality, district, lat, lon, source)
 

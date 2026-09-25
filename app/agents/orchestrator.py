@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -22,11 +23,9 @@ from app.tools.cost_tracker import CostTracker
 from app.tools.environmental import EnvironmentalTool
 from app.tools.maps import MapsTool
 from app.tools.market_data import MarketDataTool
-from app.tools.mcp_clients import MCPGoogleMapsClient, MCPPDFClient, MCPWebSearchClient
+from app.tools.mcp_clients import get_mcp_tools
 from app.tools.pdf_parser import PDFParser
 from app.tools.rate_limiter import RateLimiter
-from app.tools.scraper import Scraper
-from app.tools.web_search import WebSearchTool
 
 
 @dataclass(slots=True)
@@ -42,38 +41,31 @@ class AgentServices:
     environmental: EnvironmentalAuditor
 
 
-def create_services(settings: Settings | None = None) -> AgentServices:
+async def create_services(settings: Settings | None = None) -> AgentServices:
     settings = settings or get_settings()
     cost_tracker = CostTracker(settings.openai_model)
     rate_limiter = RateLimiter(settings.requests_per_minute, settings.max_retries)
 
-    web_mcp = MCPWebSearchClient(
-        endpoint_url=settings.mcp_web_search_url,
-        enabled=bool(settings.mcp_web_search_url and not settings.enable_mocks),
-    )
-    maps_mcp = MCPGoogleMapsClient(
-        endpoint_url=settings.mcp_google_maps_url,
-        enabled=bool(settings.mcp_google_maps_url and not settings.enable_mocks),
-    )
-    pdf_mcp = MCPPDFClient(
-        endpoint_url=settings.mcp_pdf_url,
-        enabled=bool(settings.mcp_pdf_url and not settings.enable_mocks),
-    )
+    # Get tools from the centralized MCP Manager
+    web_search_tools = await get_mcp_tools("web-search")
+    pdf_tools = await get_mcp_tools("pdf-parser")
+    maps_tools = await get_mcp_tools("google-maps")
+
+    pdf_tool = pdf_tools[0] if pdf_tools else None
 
     sqlite_store = SQLiteStore(settings.sqlite_path)
     chroma_store = ChromaStore(settings.chroma_persist_dir)
-    web_search = WebSearchTool(web_mcp, rate_limiter)
-    maps_tool = MapsTool(settings, maps_mcp, rate_limiter)
+    maps_tool = MapsTool(settings, maps_tools=maps_tools, rate_limiter=rate_limiter)
 
     return AgentServices(
         settings=settings,
         cost_tracker=cost_tracker,
         sqlite_store=sqlite_store,
         chroma_store=chroma_store,
-        researcher=Researcher(web_search, Scraper(), cost_tracker, chroma_store),
+        researcher=Researcher(tools=web_search_tools),
         logistics=LogisticsExpert(maps_tool, cost_tracker),
         market=MarketAnalyst(MarketDataTool(), cost_tracker),
-        legal=LegalPlanningScout(PDFParser(pdf_mcp), cost_tracker),
+        legal=LegalPlanningScout(PDFParser(pdf_tool=pdf_tool), cost_tracker),
         environmental=EnvironmentalAuditor(EnvironmentalTool(), cost_tracker),
     )
 
@@ -84,23 +76,28 @@ class Orchestrator:
     def __init__(self, services: AgentServices) -> None:
         self.services = services
 
-    def collect_criteria(self, state: GraphState) -> GraphState:
+    async def collect_criteria(self, state: GraphState) -> GraphState:
         state.status = WorkflowStatus.CRITERIA_COLLECTED
         state.iteration += 1
         self.services.sqlite_store.save_state(state)
         return state
 
-    def researcher_discovery(self, state: GraphState) -> GraphState:
-        state = self.services.researcher.run(state)
+    async def researcher_discovery(
+            self,
+            state: GraphState,
+    ) -> GraphState:
+        state = await self.services.researcher.run(state)
+
         self.services.sqlite_store.save_state(state)
+
         return state
 
-    def logistics_filter(self, state: GraphState) -> GraphState:
+    async def logistics_filter(self, state: GraphState) -> GraphState:
         state = self.services.logistics.run(state)
         self.services.sqlite_store.save_state(state)
         return state
 
-    def parallel_enrichment(self, state: GraphState) -> GraphState:
+    async def parallel_enrichment(self, state: GraphState) -> GraphState:
         jobs = {
             "market": lambda: self.services.market.run(state.model_copy(deep=True)),
             "legal": lambda: self.services.legal.run(state.model_copy(deep=True), deep=False),
@@ -134,18 +131,18 @@ class Orchestrator:
         self.services.sqlite_store.save_state(state)
         return state
 
-    def hitl_checkpoint(self, state: GraphState) -> GraphState:
+    async def hitl_checkpoint(self, state: GraphState) -> GraphState:
         if state.hitl_decision == HitlDecision.PENDING:
             state.status = WorkflowStatus.HITL_WAITING
         self.services.sqlite_store.save_state(state)
         return state
 
-    def legal_deep_dive(self, state: GraphState) -> GraphState:
+    async def legal_deep_dive(self, state: GraphState) -> GraphState:
         state = self.services.legal.run(state, deep=True)
         self.services.sqlite_store.save_state(state)
         return state
 
-    def final_synthesis(self, state: GraphState) -> GraphState:
+    async def final_synthesis(self, state: GraphState) -> GraphState:
         if state.hitl_decision == HitlDecision.REJECTED:
             state.final_ranking = []
             state.status = WorkflowStatus.COMPLETED
@@ -226,14 +223,14 @@ class Orchestrator:
         self.services.sqlite_store.save_state(state)
         return state
 
-    def error_handler(self, state: GraphState) -> GraphState:
+    async def error_handler(self, state: GraphState) -> GraphState:
         state.status = WorkflowStatus.ERROR
         if not state.errors:
             state.errors.append("Critical workflow error.")
         self.services.sqlite_store.save_state(state)
         return state
 
-    def self_correction(self, state: GraphState) -> GraphState:
+    async def self_correction(self, state: GraphState) -> GraphState:
         state.errors.append("Incomplete data detected; retrying with relaxed rail distance.")
         state.iteration += 1
         state.hitl_decision = HitlDecision.PENDING
@@ -243,10 +240,10 @@ class Orchestrator:
 
     def _summary_for(self, offer_id: str, state: GraphState) -> str:
         offer = state.offer_by_id(offer_id)
-        logistics = state.logistics.get(offer_id)
-        market = state.market.get(offer_id)
-        legal = state.legal.get(offer_id)
-        environmental = state.environmental.get(offer_id)
+        logistics = state.logistics.get(offer.id)
+        market = state.market.get(offer.id)
+        legal = state.legal.get(offer.id)
+        environmental = state.environmental.get(offer.id)
         pieces = []
         if offer:
             pieces.append(f"{offer.title}: {offer.price_pln:,} PLN, {offer.price_per_m2:,.0f} PLN/m2")

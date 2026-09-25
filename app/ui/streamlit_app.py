@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -15,8 +16,14 @@ from app.tools.cost_tracker import CostTracker
 
 
 def get_workflow() -> RealEstateGraph:
+    """
+    Retrieves the workflow graph instance from the session state, creating it if necessary.
+    Handles the asynchronous creation of the graph in a synchronous context.
+    """
     if "workflow" not in st.session_state:
-        st.session_state.workflow = build_graph()
+        # build_graph is an async function, so we need to run it in an event loop.
+        # asyncio.run() creates a new event loop and closes it, which is suitable here.
+        st.session_state.workflow = asyncio.run(build_graph())
     return st.session_state.workflow
 
 
@@ -191,8 +198,9 @@ def main() -> None:
     start_col, reset_col = st.columns([1, 4])
     if start_col.button("Start analysis", type="primary"):
         with st.spinner("Agenci analizują oferty..."):
-            st.session_state.graph_state = workflow.start(criteria)
-            st.rerun()
+            st.session_state.graph_state = asyncio.run(
+                workflow.start(criteria)
+            )
     if reset_col.button("Reset"):
         st.session_state.pop("graph_state", None)
         st.rerun()

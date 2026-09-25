@@ -11,6 +11,11 @@ pip install -e .
 streamlit run app/ui/streamlit_app.py
 ```
 
+Aby uruchomić MCP Web Search, to:
+```bash
+cd mcps\mcp-servers\web-search-mcp 
+npm start
+```
 Opcjonalnie testy:
 
 ```bash

@@ -14,10 +14,13 @@ dependencies = [
   "pydantic-settings>=2.6,<3",
   "langgraph>=0.2.60",
   "langchain-core>=0.3.0",
+  "langchain-openai>=0.1.15",
   "streamlit>=1.40",
   "chromadb>=0.5.20",
   "pypdf>=5.0",
   "requests>=2.32",
+  "langchain-mcp-adapters>=0.0.2",
+  "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]

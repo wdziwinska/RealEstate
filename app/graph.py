@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any, Literal, TypedDict
 
@@ -52,19 +53,30 @@ class GraphStateSchema(TypedDict, total=False):
 class RealEstateGraph:
     """LangGraph workflow wrapper with a small imperative fallback."""
 
-    def __init__(self, services: AgentServices | None = None) -> None:
-        self.services = services or create_services()
+    def __init__(self, services: AgentServices) -> None:
+        self.services = services
         self.orchestrator = Orchestrator(self.services)
         self.graph = self._build_graph()
 
-    def run(self, state: GraphState) -> GraphState:
+    @classmethod
+    async def create(cls) -> RealEstateGraph:
+        """Asynchronously creates an instance of the graph with all services initialized."""
+        services = await create_services()
+        return cls(services)
+
+    async def run(self, state: GraphState) -> GraphState:
         if self.graph is None:
             return self._fallback_run(state)
-        result = self.graph.invoke(state_to_dict(state), config={"recursion_limit": 30})
+
+        result = await self.graph.ainvoke(
+            state_to_dict(state),
+            config={"recursion_limit": 50},
+        )
+
         return ensure_state(result)
 
-    def start(self, criteria: UserCriteria) -> GraphState:
-        return self.run(GraphState(criteria=criteria))
+    async def start(self, criteria: UserCriteria) -> GraphState:
+        return await self.run(GraphState(criteria=criteria))
 
     def resume(
         self,
@@ -146,14 +158,14 @@ class RealEstateGraph:
         return builder.compile()
 
     def _node(self, func: Callable[[GraphState], GraphState]) -> Callable[[dict[str, Any]], dict[str, Any]]:
-        def wrapper(raw_state: dict[str, Any]) -> dict[str, Any]:
+        async def wrapper(raw_state: dict[str, Any]) -> dict[str, Any]:
             state = ensure_state(raw_state)
-            next_state = func(state)
+            next_state = await func(state)
             return state_to_dict(next_state)
 
         return wrapper
 
-    def _researcher_discovery(self, state: GraphState) -> GraphState:
+    async def _researcher_discovery(self, state: GraphState) -> GraphState:
         if state.hitl_decision == HitlDecision.REVISE:
             state.hitl_decision = HitlDecision.PENDING
             state.accepted_offer_ids = []
@@ -164,7 +176,7 @@ class RealEstateGraph:
             state.environmental = {}
             state.final_ranking = []
             state.status = WorkflowStatus.REVISING
-        return self.orchestrator.researcher_discovery(state)
+        return await self.orchestrator.researcher_discovery(state)
 
     def _route_start(self, raw_state: dict[str, Any]) -> Route:
         state = ensure_state(raw_state)
@@ -243,5 +255,5 @@ class RealEstateGraph:
         return self.orchestrator.hitl_checkpoint(state)
 
 
-def build_graph(services: AgentServices | None = None) -> RealEstateGraph:
-    return RealEstateGraph(services)
+async def build_graph() -> RealEstateGraph:
+    return await RealEstateGraph.create()
