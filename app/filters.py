@@ -162,13 +162,15 @@ def offer_matches_criteria(
         return False
 
     if logistics is not None:
+        if not logistics.station_active:
+            return False
+
         if logistics.station_distance_km > criteria.max_distance_to_rail_km:
             return False
 
         distance_to_center = logistics.location.distance_to_warsaw_center_km
-        if _normalize(criteria.city) == "warszawa" and distance_to_center is not None:
-            if distance_to_center > criteria.search_radius_km:
-                return False
+        if distance_to_center is not None and distance_to_center > criteria.search_radius_km:
+            return False
 
     return True
 

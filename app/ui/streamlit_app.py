@@ -122,15 +122,12 @@ def offer_rows(
         rows.append(
             {
                 "link": offer.link,
-                "id": offer.id,
-                "zrodlo": offer.source,
                 "tytuł": offer.title,
-                "opis": _short_text(offer.description, 180),
                 "adres": offer.address,
                 "gmina/dzielnica": f"{offer.municipality} {offer.district or ''}".strip(),
-                "cena": offer.price_pln,
-                "m2": offer.area_m2,
-                "PLN/m2": offer.price_per_m2,
+                "cena": _format_pln(offer.price_pln),
+                "m2": _format_number(offer.area_m2),
+                "PLN/m2": _format_pln(offer.price_per_m2),
                 "rynek": offer.market_type.value,
                 "aktualnosc": offer.availability_status.value,
                 "filtry": _filter_match_label(offer, criteria, logistics),
@@ -157,11 +154,14 @@ def _filter_match_label(
     return "poza filtrami"
 
 
-def _short_text(value: str, max_length: int) -> str:
-    value = " ".join(value.split())
-    if len(value) <= max_length:
-        return value
-    return value[: max_length - 3].rstrip() + "..."
+def _format_pln(value: float | int) -> str:
+    return f"{value:,.0f}".replace(",", " ") + " PLN"
+
+
+def _format_number(value: float | int) -> str:
+    if float(value).is_integer():
+        return f"{value:,.0f}".replace(",", " ")
+    return f"{value:,.1f}".replace(",", " ")
 
 
 OFFER_LINK_COLUMN = {
@@ -332,8 +332,8 @@ def main() -> None:
                     "link": state.offer_by_id(item.offer_id).link if state.offer_by_id(item.offer_id) else "",
                     "tytuł": item.title,
                     "score": item.score,
-                    "cena": item.price_pln,
-                    "PLN/m2": item.price_per_m2,
+                    "cena": _format_pln(item.price_pln),
+                    "PLN/m2": _format_pln(item.price_per_m2),
                     "uzasadnienie": item.summary,
                 }
                 for item in state.final_ranking

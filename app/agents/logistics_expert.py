@@ -25,18 +25,27 @@ class LogisticsExpert:
                 analysis = self.analyze_offer(state, offer.id)
                 state.logistics[offer.id] = analysis
                 offer.location = analysis.location
-                if analysis.passes_rail_filter:
+                distance_to_center = analysis.location.distance_to_warsaw_center_km
+                passes_radius_filter = (
+                    distance_to_center is None
+                    or distance_to_center <= state.criteria.search_radius_km
+                )
+                if analysis.passes_rail_filter and passes_radius_filter:
                     shortlist.append(offer)
                 else:
+                    reasons = [
+                        f"{analysis.station_distance_km} km to {analysis.nearest_station}"
+                    ]
+                    if not analysis.station_active:
+                        reasons.append("station is inactive")
+                    if not passes_radius_filter and distance_to_center is not None:
+                        reasons.append(f"{distance_to_center} km from Warsaw center")
                     state.findings.append(
                         AgentFinding(
                             agent_name=self.name,
                             offer_id=offer.id,
                             severity=FindingSeverity.INFO,
-                            message=(
-                                f"Rejected by rail filter: {analysis.station_distance_km} km "
-                                f"to {analysis.nearest_station}."
-                            ),
+                            message="Rejected by logistics filters: " + "; ".join(reasons) + ".",
                         )
                     )
             state.shortlist = shortlist
@@ -78,7 +87,7 @@ class LogisticsExpert:
             nearest_station=station.name,
             station_distance_km=distance_km,
             station_active=station.active,
-            passes_rail_filter=distance_km <= state.criteria.max_distance_to_rail_km,
+            passes_rail_filter=station.active and distance_km <= state.criteria.max_distance_to_rail_km,
             warnings=warnings,
             **commute,
         )

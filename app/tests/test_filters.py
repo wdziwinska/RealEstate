@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from app.filters import augment_search_query_with_criteria, criteria_search_query, filter_offers_by_criteria
-from app.models import MarketType, OfferAvailability, PropertyOffer, UserCriteria
+from app.models import (
+    GraphState,
+    LocationData,
+    LogisticsAnalysis,
+    MarketType,
+    OfferAvailability,
+    PropertyOffer,
+    UserCriteria,
+)
 
 
 def test_criteria_search_query_includes_gui_filters() -> None:
@@ -107,6 +115,87 @@ def test_filter_offers_by_criteria_applies_gui_values() -> None:
     )
 
     assert filtered == [matching_offer]
+
+
+def test_filter_offers_by_criteria_applies_distance_boundaries() -> None:
+    criteria = UserCriteria(
+        property_type="dom",
+        max_price_pln=1_000_000,
+        min_area_m2=100,
+        city="Warszawa",
+        search_radius_km=10,
+        max_distance_to_rail_km=1,
+    )
+    matching_offer = PropertyOffer(
+        id="matching",
+        title="Dom wolnostojacy Warszawa",
+        price_pln=1_000_000,
+        area_m2=100,
+        address="Warszawa",
+        municipality="Warszawa",
+        link="https://example.test/oferta/dom-matching",
+    )
+    too_far_from_warsaw = matching_offer.model_copy(
+        update={"id": "too-far-city", "link": "https://example.test/oferta/dom-far-city"}
+    )
+    too_far_from_pkp = matching_offer.model_copy(
+        update={"id": "too-far-pkp", "link": "https://example.test/oferta/dom-far-pkp"}
+    )
+    inactive_station = matching_offer.model_copy(
+        update={"id": "inactive-station", "link": "https://example.test/oferta/dom-inactive-station"}
+    )
+    state = GraphState(
+        criteria=criteria,
+        logistics={
+            matching_offer.id: _logistics(matching_offer.id, station_distance=1, warsaw_distance=10),
+            too_far_from_warsaw.id: _logistics(
+                too_far_from_warsaw.id,
+                station_distance=1,
+                warsaw_distance=10.1,
+            ),
+            too_far_from_pkp.id: _logistics(
+                too_far_from_pkp.id,
+                station_distance=1.1,
+                warsaw_distance=10,
+            ),
+            inactive_station.id: _logistics(
+                inactive_station.id,
+                station_distance=1,
+                warsaw_distance=10,
+                station_active=False,
+            ),
+        },
+    )
+
+    filtered = filter_offers_by_criteria(
+        [matching_offer, too_far_from_warsaw, too_far_from_pkp, inactive_station],
+        criteria,
+        state,
+    )
+
+    assert filtered == [matching_offer]
+
+
+def _logistics(
+    offer_id: str,
+    station_distance: float,
+    warsaw_distance: float,
+    station_active: bool = True,
+) -> LogisticsAnalysis:
+    return LogisticsAnalysis(
+        offer_id=offer_id,
+        location=LocationData(
+            offer_id=offer_id,
+            latitude=52.23,
+            longitude=21.01,
+            normalized_address="Warszawa",
+            distance_to_warsaw_center_km=warsaw_distance,
+        ),
+        nearest_station="Warszawa Centralna",
+        station_distance_km=station_distance,
+        station_active=station_active,
+        passes_rail_filter=station_active and station_distance <= 1,
+    )
 
 
 def test_filter_offers_by_criteria_keeps_property_type_specific() -> None:
