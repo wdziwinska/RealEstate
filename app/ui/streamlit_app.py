@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
+from app.filters import filter_offers_by_criteria
 from app.graph import RealEstateGraph, build_graph
 from app.models import GraphState, HitlDecision, MarketType, UserCriteria, WorkflowStatus
 from app.tools.cost_tracker import CostTracker
@@ -97,8 +98,13 @@ def build_criteria_form(existing: GraphState | None) -> UserCriteria:
     )
 
 
-def offer_rows(state: GraphState, shortlist_only: bool = False) -> list[dict[str, object]]:
+def offer_rows(
+    state: GraphState,
+    criteria: UserCriteria,
+    shortlist_only: bool = False,
+) -> list[dict[str, object]]:
     offers = state.shortlist if shortlist_only else state.offers
+    offers = filter_offers_by_criteria(offers, criteria, state)
     rows = []
     for offer in offers:
         logistics = state.logistics.get(offer.id)
@@ -114,6 +120,7 @@ def offer_rows(state: GraphState, shortlist_only: bool = False) -> list[dict[str
                 "cena": offer.price_pln,
                 "m2": offer.area_m2,
                 "PLN/m2": offer.price_per_m2,
+                "aktualnosc": offer.availability_status.value,
                 "rok": str(offer.year_built) if offer.year_built is not None else "Unknown",
                 "stan": offer.condition.value,
                 "PKP km": logistics.station_distance_km if logistics else None,
@@ -164,12 +171,22 @@ def render_costs(state: GraphState) -> None:
         )
 
 
-def render_offer_details(state: GraphState) -> None:
+def render_offer_details(state: GraphState, criteria: UserCriteria) -> None:
     st.subheader("Szczegóły ofert")
-    for offer in state.shortlist or state.offers:
+    offers = filter_offers_by_criteria(state.shortlist or state.offers, criteria, state)
+    for offer in offers:
         with st.expander(offer.title):
             st.write(offer.description)
             st.write(f"Link: {offer.link}")
+            st.write(f"Aktualnosc: {offer.availability_status.value}")
+            if offer.availability_checked_at:
+                st.write(
+                    "Sprawdzono: "
+                    f"{offer.availability_checked_at.isoformat()} "
+                    f"({offer.availability_source or 'unknown source'})"
+                )
+            if offer.availability_note:
+                st.caption(offer.availability_note)
             logistics = state.logistics.get(offer.id)
             market = state.market.get(offer.id)
             legal = state.legal.get(offer.id)
@@ -231,7 +248,7 @@ def main() -> None:
     if state.offers:
         st.subheader("Discovery")
         st.dataframe(
-            offer_rows(state),
+            offer_rows(state, criteria),
             hide_index=True,
             width="stretch",
             column_config=OFFER_LINK_COLUMN,
@@ -240,7 +257,7 @@ def main() -> None:
     if state.shortlist:
         st.subheader("Shortlista po filtrze PKP")
         st.dataframe(
-            offer_rows(state, shortlist_only=True),
+            offer_rows(state, criteria, shortlist_only=True),
             hide_index=True,
             width="stretch",
             column_config=OFFER_LINK_COLUMN,
@@ -248,7 +265,8 @@ def main() -> None:
 
     if state.status == WorkflowStatus.HITL_WAITING:
         st.subheader("Checkpoint HITL")
-        options = {f"{offer.title} ({offer.id[:8]})": offer.id for offer in state.shortlist}
+        visible_shortlist = filter_offers_by_criteria(state.shortlist, criteria, state)
+        options = {f"{offer.title} ({offer.id[:8]})": offer.id for offer in visible_shortlist}
         selected_labels = st.multiselect(
             "Wybierz oferty do deep dive",
             options=list(options.keys()),
@@ -301,7 +319,7 @@ def main() -> None:
     elif state.status == WorkflowStatus.COMPLETED and state.hitl_decision == HitlDecision.REJECTED:
         st.info("Analiza zakończona bez rekomendacji po odrzuceniu shortlisty.")
 
-    render_offer_details(state)
+    render_offer_details(state, criteria)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any, List
 from urllib.parse import urlparse
 
@@ -14,7 +15,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
-from app.models import GraphState, MarketType, PropertyOffer, UserCriteria, WorkflowStatus
+from app.filters import augment_search_query_with_criteria, criteria_search_query, filter_offers_by_criteria
+from app.models import GraphState, MarketType, OfferAvailability, PropertyOffer, UserCriteria, WorkflowStatus
 from app.tools.scraper import Scraper
 
 logging.basicConfig(level=logging.INFO)
@@ -41,10 +43,17 @@ MILLION_PRICE_PATTERN = re.compile(
 )
 AREA_PATTERN = re.compile(r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m²|m\^2)", re.IGNORECASE)
 
+PRICE_LABEL_PATTERN = re.compile(
+    r"(?:cena|price)\D{0,30}"
+    r"(?P<amount>\d{1,3}(?:[\s\u00a0]\d{3})+(?:[,.]\d{1,2})?)",
+    re.IGNORECASE,
+)
+
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\)\"']+")
 
 MAX_CATEGORY_EXPANSIONS = 3
 MAX_LISTING_LINKS_PER_CATEGORY = 6
+MAX_FALLBACK_SEARCHES = 8
 
 MUNICIPALITY_CANDIDATES = (
     "Ozarow Mazowiecki",
@@ -70,6 +79,47 @@ MUNICIPALITY_CANDIDATES = (
     "Nadarzyn",
     "Blonie",
 )
+
+WARSAW_AREA_FALLBACK_LOCATIONS = (
+    "Warszawa",
+    "Otwock",
+    "Piaseczno",
+    "Legionowo",
+    "Jozefow",
+    "Pruszkow",
+    "Sulejowek",
+)
+
+FALLBACK_CATEGORY_URLS = {
+    "warszawa": (
+        "https://warszawa.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/warszawa/",
+    ),
+    "otwock": (
+        "https://otwock.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/otwock/",
+    ),
+    "piaseczno": (
+        "https://piaseczno.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/piaseczno/",
+    ),
+    "legionowo": (
+        "https://legionowo.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/legionowo/",
+    ),
+    "jozefow": (
+        "https://jozefow.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/jozefow/",
+    ),
+    "pruszkow": (
+        "https://pruszkow.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/pruszkow/",
+    ),
+    "sulejowek": (
+        "https://sulejowek.nieruchomosci-online.pl/domy,sprzedaz/",
+        "https://adresowo.pl/domy/sulejowek/",
+    ),
+}
 
 WARSAW_DISTRICTS = {
     "rembertow": "Rembertow",
@@ -110,6 +160,50 @@ DETAIL_URL_MARKERS = (
     "/ob/",
     "/dom-",
     "/mieszkanie-",
+)
+
+INACTIVE_LISTING_MARKERS = (
+    "oferta archiwalna",
+    "ogloszenie archiwalne",
+    "ogloszenie jest archiwalne",
+    "oferta nieaktualna",
+    "ogloszenie nieaktualne",
+    "nieaktualne ogloszenie",
+    "nieaktualna oferta",
+    "ta oferta jest juz nieaktualna",
+    "ogloszenie wygaslo",
+    "oferta wygasla",
+    "sprzedane",
+    "sprzedany",
+    "nieruchomosc sprzedana",
+    "zostalo sprzedane",
+    "zostala sprzedana",
+    "usuniete ogloszenie",
+    "ogloszenie usuniete",
+    "oferta usunieta",
+    "nie znaleziono ogloszenia",
+    "strona nie istnieje",
+    "404 not found",
+    "page not found",
+    "listing is no longer available",
+    "no longer available",
+    "sold",
+    "expired",
+    "archived",
+    "removed",
+)
+
+ACTIVE_LISTING_MARKERS = (
+    "oferta aktualna",
+    "ogloszenie aktualne",
+    "na sprzedaz",
+    "kontakt",
+    "zapytaj",
+    "umow prezentacje",
+    "zadaj pytanie",
+    "zobacz telefon",
+    "cena",
+    "powierzchnia",
 )
 
 POLISH_TRANSLATION = str.maketrans(
@@ -176,68 +270,12 @@ class Researcher:
         when raw_query was not provided.
         """
 
-        # Pydantic v2
-        if hasattr(criteria, "model_dump"):
-            data = criteria.model_dump()
-        else:
-            data = vars(criteria)
-
-        # raw_query is handled separately
-        data.pop("raw_query", None)
-
-        parts: list[str] = []
-
-        for key, value in data.items():
-            if value is None:
-                continue
-
-            if value == "":
-                continue
-
-            if isinstance(value, bool):
-                if not value:
-                    continue
-
-                parts.append(
-                    f"{key.replace('_', ' ')}: yes"
-                )
-                continue
-
-            if isinstance(value, (list, tuple, set)):
-                if not value:
-                    continue
-
-                value = ", ".join(str(item) for item in value)
-
-            parts.append(
-                f"{key.replace('_', ' ')}: {value}"
-            )
-
-        if not parts:
-            return (
-                "Find residential real estate offers in Warsaw "
-                "and within 30 km of Warsaw."
-            )
-
-        return (
-            "Find residential real estate offers in Warsaw "
-            "and within 30 km of Warsaw matching these criteria: "
-            + "; ".join(parts)
-        )
+        return criteria_search_query(criteria)
 
     def _get_search_query(self, state: GraphState) -> str:
         """
         Prefer original user query, but fall back to structured criteria.
         """
-
-        raw_query = getattr(
-            state.criteria,
-            "raw_query",
-            None,
-        )
-
-        if raw_query and raw_query.strip():
-            return raw_query.strip()
 
         return self._build_query_from_criteria(
             state.criteria
@@ -303,48 +341,63 @@ class Researcher:
             response.tool_calls,
         )
 
-        if response.tool_calls:
-            tool_map = {
-                tool.name: tool
-                for tool in self.tools
-            }
+        tool_map = {
+            tool.name: tool
+            for tool in self.tools
+        }
+        attempted_queries: list[str] = []
 
-            for call in response.tool_calls:
-                tool_name = call["name"]
-                tool_args = call["args"]
+        for call in response.tool_calls or []:
+            tool_name = call["name"]
+            tool_args = self._tool_args_with_gui_filters(
+                call["args"],
+                state.criteria,
+                tool_name,
+            )
 
-                tool = tool_map.get(tool_name)
-                logger.info("Tool requested by LLM: %s", tool_name)
+            tool = tool_map.get(tool_name)
+            logger.info("Tool requested by LLM: %s", tool_name)
 
-                if tool is None:
-                    logger.error(
-                        f"Unknown tool requested by LLM: {tool_name}"
-                    )
-                    continue
-
-                logger.info(
-                    f"Executing MCP tool: {tool_name}"
+            if tool is None:
+                logger.error(
+                    f"Unknown tool requested by LLM: {tool_name}"
                 )
-                logger.info(
-                    f"Tool arguments: {tool_args}"
-                )
+                continue
 
-                result = await tool.ainvoke(tool_args)
+            logger.info(
+                f"Executing MCP tool: {tool_name}"
+            )
+            logger.info(
+                f"Tool arguments: {tool_args}"
+            )
 
-                logger.info(
-                    "Tool result: %s",
-                    result,
-                )
+            result = await tool.ainvoke(tool_args)
 
-                tool_query = self._query_from_tool_args(tool_args, fallback=search_query)
-                offers = await self._offers_from_tool_result(
-                    result,
-                    state.criteria,
-                    tool_query,
-                    tool_map,
-                )
-                added_count = self._add_unique_offers(state, offers)
-                logger.info("Researcher stored %d new offers from %s", added_count, tool_name)
+            logger.info(
+                "Tool result: %s",
+                result,
+            )
+
+            tool_query = self._query_from_tool_args(tool_args, fallback=search_query)
+            attempted_queries.append(tool_query)
+            offers = await self._offers_from_tool_result(
+                result,
+                state.criteria,
+                tool_query,
+                tool_map,
+            )
+            offers = filter_offers_by_criteria(offers, state.criteria)
+            added_count = self._add_unique_offers(state, offers)
+            logger.info("Researcher stored %d new offers from %s", added_count, tool_name)
+
+        if not state.offers:
+            added_count = await self._run_fallback_searches(
+                state,
+                search_query,
+                tool_map,
+                attempted_queries,
+            )
+            logger.info("Researcher fallback stored %d new offers", added_count)
 
         if state.offers:
             state.status = WorkflowStatus.DISCOVERY_DONE
@@ -361,6 +414,190 @@ class Researcher:
                 return value.strip()
 
         return fallback
+
+    def _tool_args_with_gui_filters(
+        self,
+        tool_args: Any,
+        criteria: UserCriteria,
+        tool_name: str,
+    ) -> Any:
+        if not isinstance(tool_args, dict):
+            return tool_args
+        if tool_name not in {"get-web-search-summaries", "full-web-search"}:
+            return tool_args
+
+        next_args = dict(tool_args)
+        query_key = next(
+            (key for key in ("query", "search_query", "q") if isinstance(next_args.get(key), str)),
+            "query",
+        )
+        next_args[query_key] = augment_search_query_with_criteria(next_args.get(query_key), criteria)
+        next_args.setdefault("limit", 10)
+        return next_args
+
+    async def _run_fallback_searches(
+        self,
+        state: GraphState,
+        search_query: str,
+        tool_map: dict[str, BaseTool],
+        attempted_queries: list[str],
+    ) -> int:
+        search_tool = tool_map.get("get-web-search-summaries")
+        added_total = 0
+        attempted = {
+            self._normalize_query(query)
+            for query in attempted_queries
+            if query
+        }
+
+        if search_tool is not None:
+            for fallback_query in self._fallback_search_queries(
+                state.criteria,
+                search_query,
+            ):
+                normalized_query = self._normalize_query(fallback_query)
+                if normalized_query in attempted:
+                    continue
+                attempted.add(normalized_query)
+
+                tool_args = self._tool_args_with_gui_filters(
+                    {
+                        "query": fallback_query,
+                        "limit": 10,
+                    },
+                    state.criteria,
+                    search_tool.name,
+                )
+                tool_query = self._query_from_tool_args(tool_args, fallback=fallback_query)
+
+                logger.info("Fallback MCP search arguments: %s", tool_args)
+                try:
+                    result = await search_tool.ainvoke(tool_args)
+                except Exception as exc:
+                    logger.warning("Fallback MCP search failed for %s: %s", tool_query, exc)
+                    continue
+
+                logger.info("Fallback MCP search result: %s", result)
+                offers = await self._offers_from_tool_result(
+                    result,
+                    state.criteria,
+                    tool_query,
+                    tool_map,
+                )
+                offers = filter_offers_by_criteria(offers, state.criteria)
+                added_count = self._add_unique_offers(state, offers)
+                added_total += added_count
+
+                if added_count:
+                    return added_total
+
+        category_offers = await self._expand_category_results(
+            self._fallback_category_results(state.criteria, search_query),
+            tool_map,
+            state.criteria,
+            search_query,
+        )
+        category_offers = await self._verify_offer_availability(category_offers, tool_map)
+        category_offers = filter_offers_by_criteria(category_offers, state.criteria)
+        added_total += self._add_unique_offers(state, category_offers)
+        return added_total
+
+    def _fallback_search_queries(
+        self,
+        criteria: UserCriteria,
+        search_query: str,
+    ) -> list[str]:
+        property_type = criteria.property_type.strip() or "nieruchomosc"
+        price = int(criteria.max_price_pln)
+        candidates = [search_query, criteria_search_query(criteria)]
+
+        for location in self._fallback_locations(criteria, search_query):
+            candidates.extend(
+                [
+                    f"{property_type} na sprzedaz {location} do {price} zl",
+                    f"{property_type} {location} do {price} zl oferta",
+                    f"site:otodom.pl/pl/oferta {property_type} {location} do {price}",
+                    f"site:olx.pl/d/oferta {property_type} {location} do {price}",
+                ]
+            )
+
+        return self._dedupe_queries(candidates)[:MAX_FALLBACK_SEARCHES]
+
+    def _fallback_category_results(
+        self,
+        criteria: UserCriteria,
+        search_query: str,
+    ) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
+        property_type = criteria.property_type.strip() or "nieruchomosc"
+
+        for location in self._fallback_locations(criteria, search_query):
+            urls = self._fallback_category_urls(location, property_type)
+            for url in urls:
+                results.append(
+                    {
+                        "title": f"{property_type} na sprzedaz {location}",
+                        "link": url,
+                        "description": (
+                            f"Awaryjna strona kategorii dla lokalizacji {location}; "
+                            "uzywana, gdy MCP search zwroci 0 wynikow."
+                        ),
+                    }
+                )
+
+        return results
+
+    def _fallback_category_urls(
+        self,
+        location: str,
+        property_type: str,
+    ) -> tuple[str, ...]:
+        urls = FALLBACK_CATEGORY_URLS.get(self._normalize(location), ())
+        if "mieszkan" not in self._normalize(property_type):
+            return urls
+
+        return tuple(
+            url.replace("/domy,sprzedaz/", "/mieszkania,sprzedaz/")
+            .replace("/domy/", "/mieszkania/")
+            for url in urls
+        )
+
+    def _fallback_locations(
+        self,
+        criteria: UserCriteria,
+        search_query: str,
+    ) -> list[str]:
+        locations: list[str] = []
+        normalized_query = self._normalize(search_query)
+
+        for candidate in MUNICIPALITY_CANDIDATES:
+            if self._normalize(candidate) in normalized_query:
+                locations.append(candidate)
+
+        if criteria.city:
+            locations.append(criteria.city)
+
+        if self._normalize(criteria.city) == "warszawa":
+            locations.extend(WARSAW_AREA_FALLBACK_LOCATIONS)
+
+        return self._dedupe_queries(locations)
+
+    def _dedupe_queries(self, queries: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            cleaned = self._clean_text(query)
+            if not cleaned:
+                continue
+            normalized = self._normalize_query(cleaned)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(cleaned)
+        return unique
+
+    def _normalize_query(self, query: str) -> str:
+        return re.sub(r"\s+", " ", self._normalize(query)).strip()
 
     async def _offers_from_tool_result(
         self,
@@ -388,7 +625,8 @@ class Researcher:
                 tool_query,
             )
         )
-        return self._dedupe_offers(offers)
+        offers = self._dedupe_offers(offers)
+        return await self._verify_offer_availability(offers, tool_map)
 
     def _result_text_blocks(self, result: Any) -> list[str]:
         if isinstance(result, str):
@@ -396,7 +634,10 @@ class Researcher:
 
         if isinstance(result, dict):
             text = result.get("text")
-            return [text] if isinstance(text, str) and text.strip() else []
+            if isinstance(text, str) and text.strip():
+                return [text]
+            content = result.get("content")
+            return self._result_text_blocks(content) if content is not None else []
 
         if isinstance(result, list):
             texts: list[str] = []
@@ -559,6 +800,143 @@ class Researcher:
 
         return self._dedupe_offers(offers)
 
+    async def _verify_offer_availability(
+        self,
+        offers: list[PropertyOffer],
+        tool_map: dict[str, BaseTool],
+    ) -> list[PropertyOffer]:
+        page_tool = tool_map.get("get-single-web-page-content")
+        verified: list[PropertyOffer] = []
+
+        for offer in offers:
+            summary_status, summary_note = self._availability_from_text(
+                " ".join([offer.title, offer.description, offer.link]),
+                "search summary",
+            )
+            if summary_status == OfferAvailability.INACTIVE:
+                logger.info(
+                    "Skipping inactive listing from search summary: %s (%s)",
+                    offer.link,
+                    summary_note,
+                )
+                continue
+
+            if page_tool is None:
+                offer.availability_status = OfferAvailability.UNKNOWN
+                offer.availability_note = "Availability not checked; page-content tool unavailable."
+                self._append_warning_once(
+                    offer,
+                    "Listing availability not verified; page-content tool unavailable.",
+                )
+                verified.append(offer)
+                continue
+
+            checked_offer = await self._offer_with_page_availability(offer, page_tool)
+            if checked_offer.availability_status != OfferAvailability.ACTIVE:
+                logger.info(
+                    "Skipping listing without confirmed active status: %s (%s)",
+                    checked_offer.link,
+                    checked_offer.availability_note,
+                )
+                continue
+
+            verified.append(checked_offer)
+
+        return verified
+
+    async def _offer_with_page_availability(
+        self,
+        offer: PropertyOffer,
+        page_tool: BaseTool,
+    ) -> PropertyOffer:
+        offer.availability_checked_at = datetime.now(timezone.utc)
+        offer.availability_source = "source_page"
+
+        try:
+            page_result = await page_tool.ainvoke(
+                {
+                    "url": offer.link,
+                    "maxContentLength": 15000,
+                }
+            )
+        except Exception as exc:
+            offer.availability_status = OfferAvailability.UNKNOWN
+            offer.availability_note = f"Availability check failed: {exc}"
+            self._append_warning_once(
+                offer,
+                "Listing availability could not be checked from source page.",
+            )
+            return offer
+
+        page_text = "\n".join(self._result_text_blocks(page_result))
+        status, note = self._availability_from_text(page_text, "source page")
+        offer.availability_status = status
+        offer.availability_note = note
+
+        if status == OfferAvailability.INACTIVE:
+            self._append_warning_once(
+                offer,
+                "Listing page says the offer is no longer available.",
+            )
+        elif status == OfferAvailability.UNKNOWN:
+            self._append_warning_once(
+                offer,
+                "Listing availability could not be confirmed from source page.",
+            )
+
+        return offer
+
+    def _availability_from_text(
+        self,
+        text: str,
+        source: str,
+    ) -> tuple[OfferAvailability, str]:
+        if not text.strip():
+            return OfferAvailability.UNKNOWN, f"No text returned from {source}."
+
+        normalized = self._normalize(text)
+        inactive_marker = self._first_marker(normalized, INACTIVE_LISTING_MARKERS)
+        if inactive_marker:
+            return (
+                OfferAvailability.INACTIVE,
+                f"{source} contains inactive marker: {inactive_marker}",
+            )
+
+        if self._has_active_listing_evidence(text, normalized):
+            return OfferAvailability.ACTIVE, f"{source} contains active listing evidence."
+
+        return OfferAvailability.UNKNOWN, f"{source} does not confirm the listing is active."
+
+    def _has_active_listing_evidence(self, text: str, normalized_text: str) -> bool:
+        if self._first_marker(normalized_text, ACTIVE_LISTING_MARKERS):
+            return True
+
+        has_price = (
+            bool(PRICE_PATTERN.search(text))
+            or bool(PRICE_LABEL_PATTERN.search(text))
+            or bool(MILLION_PRICE_PATTERN.search(normalized_text))
+        )
+        has_area = bool(AREA_PATTERN.search(text))
+        has_contact_hint = any(
+            marker in normalized_text
+            for marker in (
+                "telefon",
+                "kontakt",
+                "formularz",
+                "zapytaj",
+                "wyslij wiadomosc",
+                "umow",
+            )
+        )
+        return has_price and has_area and has_contact_hint
+
+    def _first_marker(self, text: str, markers: tuple[str, ...]) -> str | None:
+        return next((marker for marker in markers if marker in text), None)
+
+    def _append_warning_once(self, offer: PropertyOffer, warning: str) -> None:
+        if warning not in offer.warnings:
+            offer.warnings.append(warning)
+
     def _offer_from_listing_result(
         self,
         result: dict[str, str],
@@ -570,16 +948,17 @@ class Researcher:
         title = self._clean_text(result["title"])
         link = self._clean_url(result["link"])
         description = self._clean_text(result["description"])
+        listing_text = " ".join([title, description, link])
         combined_text = " ".join([title, description, tool_query, link])
 
         if not self._is_listing_detail_page(link, combined_text):
             logger.info("Skipping non-detail listing result: %s", link)
             return None
 
-        price_pln, price_warnings = self._extract_price_pln(combined_text, criteria)
-        area_m2, area_warnings = self._extract_area_m2(combined_text, criteria, price_pln)
-        municipality, district = self._infer_location(combined_text, criteria)
-        market_type = self._infer_market_type(combined_text, criteria)
+        price_pln, price_warnings = self._extract_price_pln(listing_text, criteria)
+        area_m2, area_warnings = self._extract_area_m2(listing_text, criteria, price_pln)
+        municipality, district = self._infer_location(listing_text, criteria)
+        market_type = self._infer_market_type(listing_text, criteria)
         scraped = self.scraper.scrape_listing(link, description)
 
         return PropertyOffer(
@@ -662,7 +1041,11 @@ class Researcher:
         if any(marker in normalized_link for marker in DETAIL_URL_MARKERS):
             return True
 
-        has_price = bool(PRICE_PATTERN.search(text)) or bool(MILLION_PRICE_PATTERN.search(normalized_text))
+        has_price = (
+            bool(PRICE_PATTERN.search(text))
+            or bool(PRICE_LABEL_PATTERN.search(text))
+            or bool(MILLION_PRICE_PATTERN.search(normalized_text))
+        )
         has_area = bool(AREA_PATTERN.search(text))
         generic_title = any(
             marker in normalized_text
@@ -714,6 +1097,13 @@ class Researcher:
             price_matches = [
                 self._parse_number(match.group("amount"))
                 for match in PRICE_PATTERN.finditer(normalized)
+            ]
+            price_matches = [price for price in price_matches if price is not None and price > 0]
+
+        if not price_matches:
+            price_matches = [
+                self._parse_number(match.group("amount"))
+                for match in PRICE_LABEL_PATTERN.finditer(text)
             ]
             price_matches = [price for price in price_matches if price is not None and price > 0]
 

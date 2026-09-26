@@ -23,6 +23,12 @@ class MarketType(StrEnum):
     UNKNOWN = "unknown"
 
 
+class OfferAvailability(StrEnum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    UNKNOWN = "unknown"
+
+
 class WorkflowStatus(StrEnum):
     NEW = "new"
     CRITERIA_COLLECTED = "criteria_collected"
@@ -93,6 +99,10 @@ class PropertyOffer(BaseModel):
     year_built: int | None = None
     condition: PropertyCondition = PropertyCondition.UNKNOWN
     market_type: MarketType = MarketType.UNKNOWN
+    availability_status: OfferAvailability = OfferAvailability.UNKNOWN
+    availability_checked_at: datetime | None = None
+    availability_source: str | None = None
+    availability_note: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     location: "LocationData | None" = None
     warnings: list[str] = Field(default_factory=list)

@@ -105,6 +105,16 @@ class MCPManager:
             )
             return
 
+        wrapper_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "web_search_mcp_stdio_wrapper.mjs"
+        )
+        use_stdio_wrapper = os.getenv(
+            "MCP_WEB_SEARCH_STDIO_WRAPPER",
+            "true",
+        ).lower() not in {"0", "false", "no"}
+
         node_command = os.getenv(
             "MCP_WEB_SEARCH_COMMAND",
             "node",
@@ -152,19 +162,31 @@ class MCPManager:
                 "MCP_WEB_SEARCH_FORCE_MULTI_ENGINE_SEARCH",
                 "false",
             ),
+
+            "MCP_WEB_SEARCH_REAL_SCRIPT": str(script_path),
         }
+
+        args = [str(script_path)]
+        if use_stdio_wrapper:
+            if wrapper_path.is_file():
+                args = [str(wrapper_path), str(script_path)]
+            else:
+                logger.warning(
+                    "MCP stdio wrapper enabled but not found: %s",
+                    wrapper_path,
+                )
 
         self.servers_config["web-search"] = {
             "transport": "stdio",
             "command": node_command,
-            "args": [str(script_path)],
+            "args": args,
             "env": mcp_env,
         }
 
         logger.info(
             "Web Search MCP configured via stdio: %s %s",
             node_command,
-            script_path,
+            " ".join(args),
         )
 
     async def get_tools(
