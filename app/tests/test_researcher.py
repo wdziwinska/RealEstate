@@ -84,8 +84,9 @@ class FakeActiveDetailPageTool:
             {
                 "type": "text",
                 "text": (
-                    "Oferta aktualna. Dom wolnostojacy Otwock, powierzchnia 180 m2, "
-                    "cena 1 450 000 zl. Kontakt do sprzedajacego."
+                    "Oferta aktualna. Dom wolnostojacy Otwock, powierzchnia 190 m2, "
+                    "cena 1 390 000 zl. Rok budowy 2010, stan bardzo dobry, "
+                    "rynek wtorny. Kontakt do sprzedajacego."
                 ),
             }
         ]
@@ -183,6 +184,9 @@ def test_researcher_marks_offer_active_when_source_page_confirms_it() -> None:
     assert offers[0].availability_status == OfferAvailability.ACTIVE
     assert offers[0].availability_checked_at is not None
     assert offers[0].availability_source == "source_page"
+    assert offers[0].price_pln == 1_390_000
+    assert offers[0].area_m2 == 190
+    assert offers[0].year_built == 2010
 
 
 def test_researcher_drops_inactive_source_page_offers() -> None:
@@ -246,6 +250,8 @@ def test_researcher_passes_gui_filters_to_search_tool() -> None:
     query = search_tool.calls[0]["query"]
     assert "Otwock" in query
     assert "do 1700000 zl" in query
+    assert "od 120 m2" in query
+    assert "rynek wtorny" in query
     assert "2500000" not in query
     assert "filtry GUI" not in query
     assert "cena maks." not in query

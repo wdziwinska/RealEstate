@@ -497,7 +497,11 @@ class Researcher:
             state.criteria,
             search_query,
         )
-        category_offers = await self._verify_offer_availability(category_offers, tool_map)
+        category_offers = await self._verify_offer_availability(
+            category_offers,
+            tool_map,
+            state.criteria,
+        )
         category_offers = filter_offers_by_criteria(category_offers, state.criteria)
         added_total += self._add_unique_offers(state, category_offers)
         return added_total
@@ -626,7 +630,7 @@ class Researcher:
             )
         )
         offers = self._dedupe_offers(offers)
-        return await self._verify_offer_availability(offers, tool_map)
+        return await self._verify_offer_availability(offers, tool_map, criteria)
 
     def _result_text_blocks(self, result: Any) -> list[str]:
         if isinstance(result, str):
@@ -804,6 +808,7 @@ class Researcher:
         self,
         offers: list[PropertyOffer],
         tool_map: dict[str, BaseTool],
+        criteria: UserCriteria,
     ) -> list[PropertyOffer]:
         page_tool = tool_map.get("get-single-web-page-content")
         verified: list[PropertyOffer] = []
@@ -831,7 +836,7 @@ class Researcher:
                 verified.append(offer)
                 continue
 
-            checked_offer = await self._offer_with_page_availability(offer, page_tool)
+            checked_offer = await self._offer_with_page_availability(offer, page_tool, criteria)
             if checked_offer.availability_status != OfferAvailability.ACTIVE:
                 logger.info(
                     "Skipping listing without confirmed active status: %s (%s)",
@@ -848,6 +853,7 @@ class Researcher:
         self,
         offer: PropertyOffer,
         page_tool: BaseTool,
+        criteria: UserCriteria,
     ) -> PropertyOffer:
         offer.availability_checked_at = datetime.now(timezone.utc)
         offer.availability_source = "source_page"
@@ -883,8 +889,68 @@ class Researcher:
                 offer,
                 "Listing availability could not be confirmed from source page.",
             )
+        else:
+            self._enrich_offer_from_source_page(offer, page_text, criteria)
 
         return offer
+
+    def _enrich_offer_from_source_page(
+        self,
+        offer: PropertyOffer,
+        page_text: str,
+        criteria: UserCriteria,
+    ) -> None:
+        source_text = self._clean_text(page_text)
+        if not source_text:
+            return
+
+        if self._text_has_price(source_text):
+            price_pln, price_warnings = self._extract_price_pln(source_text, criteria)
+            offer.price_pln = price_pln
+            for warning in price_warnings:
+                self._append_warning_once(offer, warning)
+
+        if AREA_PATTERN.search(source_text):
+            area_m2, area_warnings = self._extract_area_m2(
+                source_text,
+                criteria,
+                offer.price_pln,
+            )
+            offer.area_m2 = area_m2
+            for warning in area_warnings:
+                self._append_warning_once(offer, warning)
+
+        municipality, district = self._infer_location(
+            " ".join([offer.title, source_text, offer.link]),
+            criteria,
+        )
+        offer.municipality = municipality
+        offer.district = district
+        offer.address = self._address_from_location(municipality, district)
+        offer.market_type = self._infer_market_type(source_text, criteria)
+
+        year_built = self.scraper.extract_year_built(source_text)
+        if year_built is not None:
+            offer.year_built = year_built
+
+        condition = self.scraper.classify_condition(source_text)
+        if condition.value != "Unknown":
+            offer.condition = condition
+
+        offer.description = self._source_page_description(source_text, offer.description)
+
+    def _text_has_price(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        return (
+            bool(PRICE_PATTERN.search(text))
+            or bool(PRICE_LABEL_PATTERN.search(text))
+            or bool(MILLION_PRICE_PATTERN.search(normalized))
+        )
+
+    def _source_page_description(self, source_text: str, fallback: str) -> str:
+        if len(source_text) < max(80, len(fallback)):
+            return fallback
+        return source_text[:700]
 
     def _availability_from_text(
         self,
@@ -1169,7 +1235,7 @@ class Researcher:
             return MarketType.PRIMARY
         if "wtorny" in normalized:
             return MarketType.SECONDARY
-        return criteria.market_type
+        return MarketType.UNKNOWN
 
     def _looks_like_category_page(self, text: str) -> bool:
         normalized = self._normalize(text)

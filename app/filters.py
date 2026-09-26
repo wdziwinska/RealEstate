@@ -10,6 +10,11 @@ PRICE_CAP_PATTERN = re.compile(
     r"\bdo\s+\d[\d\s\u00a0]*(?:[,.]\d+)?(?:\s*(?:mln|milion[a-z]*))?\s*(?:zl|z\u0142|pln)?",
     re.IGNORECASE,
 )
+AREA_MIN_PATTERN = re.compile(
+    r"\b(?:od|min\.?|minimum)\s*\d+(?:[,.]\d+)?\s*(?:m2|m\u00b2|m\^2)\b",
+    re.IGNORECASE,
+)
+MARKET_QUERY_PATTERN = re.compile(r"\brynek\s+(?:pierwotny|wtorny|wt\u00f3rny)\b", re.IGNORECASE)
 DEBUG_FILTER_PATTERN = re.compile(r";?\s*filtry GUI:.*$", re.IGNORECASE)
 SEARCH_NOISE_PATTERNS = (
     re.compile(r"\bblisko\s+(?:lasu|parku|zieleni|pkp|stacji|kolei)\b", re.IGNORECASE),
@@ -32,6 +37,23 @@ LOCATION_HINTS = (
     "wawer",
     "rembertow",
     "warszawa",
+)
+
+HOUSE_TERMS = (
+    "dom",
+    "segment",
+    "blizniak",
+    "blizniaczy",
+    "szeregowiec",
+    "wolnostojacy",
+    "rezydencja",
+    "willa",
+)
+APARTMENT_TERMS = (
+    "mieszkan",
+    "apartament",
+    "kawalerka",
+    "lokal mieszkalny",
 )
 
 POLISH_TRANSLATION = str.maketrans(
@@ -68,6 +90,8 @@ def augment_search_query_with_criteria(query: str | None, criteria: UserCriteria
 
     base_query = DEBUG_FILTER_PATTERN.sub("", (query or "").strip())
     base_query = PRICE_CAP_PATTERN.sub("", base_query).strip(" ,;")
+    base_query = AREA_MIN_PATTERN.sub("", base_query).strip(" ,;")
+    base_query = MARKET_QUERY_PATTERN.sub("", base_query).strip(" ,;")
     base_query = _strip_search_noise(base_query)
     normalized = _normalize(base_query)
 
@@ -84,6 +108,13 @@ def augment_search_query_with_criteria(query: str | None, criteria: UserCriteria
         parts.append(criteria.city)
 
     parts.append(f"do {criteria.max_price_pln} zl")
+
+    if criteria.min_area_m2:
+        parts.append(f"od {criteria.min_area_m2:g} m2")
+
+    market_term = _market_query_term(criteria)
+    if market_term:
+        parts.append(market_term)
 
     return _join_terms(parts)
 
@@ -173,9 +204,9 @@ def _matches_property_type(offer: PropertyOffer, criteria: UserCriteria) -> bool
 
     haystack = _offer_text(offer)
     if "mieszkan" in requested:
-        return "mieszkan" in haystack or "apartament" in haystack or "dom" not in haystack
+        return _contains_any(haystack, APARTMENT_TERMS)
     if "dom" in requested:
-        return "dom" in haystack or "mieszkan" not in haystack
+        return _contains_any(haystack, HOUSE_TERMS)
 
     return requested in haystack or requested.replace(" ", "-") in haystack
 
@@ -222,6 +253,14 @@ def _should_add_city(query: str, criteria: UserCriteria) -> bool:
 
 def _contains_any(value: str, candidates: tuple[str, ...]) -> bool:
     return any(candidate in value for candidate in candidates)
+
+
+def _market_query_term(criteria: UserCriteria) -> str:
+    if criteria.market_type == MarketType.PRIMARY:
+        return "rynek pierwotny"
+    if criteria.market_type == MarketType.SECONDARY:
+        return "rynek wtorny"
+    return ""
 
 
 def _join_terms(parts: list[str]) -> str:

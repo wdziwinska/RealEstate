@@ -10,9 +10,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from app.filters import filter_offers_by_criteria
+from app.filters import criteria_filter_summary, filter_offers_by_criteria, offer_matches_criteria
 from app.graph import RealEstateGraph, build_graph
-from app.models import GraphState, HitlDecision, MarketType, UserCriteria, WorkflowStatus
+from app.models import (
+    GraphState,
+    HitlDecision,
+    LogisticsAnalysis,
+    MarketType,
+    PropertyOffer,
+    UserCriteria,
+    WorkflowStatus,
+)
 from app.tools.cost_tracker import CostTracker
 
 
@@ -113,14 +121,19 @@ def offer_rows(
         environmental = state.environmental.get(offer.id)
         rows.append(
             {
-                "id": offer.id,
                 "link": offer.link,
+                "id": offer.id,
+                "zrodlo": offer.source,
                 "tytuł": offer.title,
+                "opis": _short_text(offer.description, 180),
+                "adres": offer.address,
                 "gmina/dzielnica": f"{offer.municipality} {offer.district or ''}".strip(),
                 "cena": offer.price_pln,
                 "m2": offer.area_m2,
                 "PLN/m2": offer.price_per_m2,
+                "rynek": offer.market_type.value,
                 "aktualnosc": offer.availability_status.value,
+                "filtry": _filter_match_label(offer, criteria, logistics),
                 "rok": str(offer.year_built) if offer.year_built is not None else "Unknown",
                 "stan": offer.condition.value,
                 "PKP km": logistics.station_distance_km if logistics else None,
@@ -132,6 +145,23 @@ def offer_rows(
             }
         )
     return rows
+
+
+def _filter_match_label(
+    offer: PropertyOffer,
+    criteria: UserCriteria,
+    logistics: LogisticsAnalysis | None,
+) -> str:
+    if offer_matches_criteria(offer, criteria, logistics):
+        return "OK"
+    return "poza filtrami"
+
+
+def _short_text(value: str, max_length: int) -> str:
+    value = " ".join(value.split())
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3].rstrip() + "..."
 
 
 OFFER_LINK_COLUMN = {
@@ -247,6 +277,7 @@ def main() -> None:
 
     if state.offers:
         st.subheader("Discovery")
+        st.caption("Aktywne filtry: " + criteria_filter_summary(criteria))
         st.dataframe(
             offer_rows(state, criteria),
             hide_index=True,
@@ -256,6 +287,7 @@ def main() -> None:
 
     if state.shortlist:
         st.subheader("Shortlista po filtrze PKP")
+        st.caption("Aktywne filtry: " + criteria_filter_summary(criteria))
         st.dataframe(
             offer_rows(state, criteria, shortlist_only=True),
             hide_index=True,

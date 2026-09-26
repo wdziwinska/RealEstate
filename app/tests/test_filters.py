@@ -22,9 +22,9 @@ def test_criteria_search_query_includes_gui_filters() -> None:
     assert "dom" in query
     assert "Otwock" in query
     assert "do 1700000 zl" in query
-    assert "od 120 m2" not in query
+    assert "od 120 m2" in query
+    assert "rynek wtorny" in query
     assert "blisko PKP" not in query
-    assert "rynek wtorny" not in query
     assert "filtry GUI" not in query
     assert "cena maks." not in query
 
@@ -33,19 +33,25 @@ def test_augment_search_query_keeps_location_and_uses_clean_filter_terms() -> No
     criteria = UserCriteria(
         property_type="dom",
         max_price_pln=1_500_000,
+        min_area_m2=140,
         city="Warszawa",
         max_distance_to_rail_km=2,
         prefer_green=True,
+        market_type=MarketType.SECONDARY,
     )
 
     query = augment_search_query_with_criteria(
-        "dom na sprzedaz Otwock do 2500000; filtry GUI: cena maks.: 2500000 PLN",
+        "dom na sprzedaz Otwock do 2500000 od 80 m2 rynek pierwotny; filtry GUI: cena maks.: 2500000 PLN",
         criteria,
     )
 
     assert "Otwock" in query
     assert "Warszawa" not in query
     assert "do 1500000 zl" in query
+    assert "od 140 m2" in query
+    assert "80 m2" not in query
+    assert "rynek wtorny" in query
+    assert "rynek pierwotny" not in query
     assert "2500000" not in query
     assert "blisko PKP" not in query
     assert "blisko lasu" not in query
@@ -101,6 +107,30 @@ def test_filter_offers_by_criteria_applies_gui_values() -> None:
     )
 
     assert filtered == [matching_offer]
+
+
+def test_filter_offers_by_criteria_keeps_property_type_specific() -> None:
+    criteria = UserCriteria(property_type="dom", max_price_pln=900_000, city="Otwock")
+    house_offer = PropertyOffer(
+        title="Dom wolnostojacy Otwock",
+        price_pln=850_000,
+        area_m2=120,
+        address="Otwock",
+        municipality="Otwock",
+        link="https://example.test/oferta/dom",
+    )
+    apartment_offer = PropertyOffer(
+        title="Apartament Otwock centrum",
+        price_pln=650_000,
+        area_m2=60,
+        address="Otwock",
+        municipality="Otwock",
+        link="https://example.test/oferta/apartament",
+    )
+
+    filtered = filter_offers_by_criteria([house_offer, apartment_offer], criteria)
+
+    assert filtered == [house_offer]
 
 
 def test_filter_offers_by_criteria_excludes_inactive_offers() -> None:
