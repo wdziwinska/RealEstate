@@ -9,6 +9,11 @@ class Scraper:
     """Mock-friendly extraction helpers used after web-search snippets."""
 
     YEAR_PATTERN = re.compile(r"\b(19[4-9]\d|20[0-2]\d)\b")
+    YEAR_BUILT_PATTERN = re.compile(
+        r"(?:rok\s+budowy|budowy|wybudowan\w*|zbudowan\w*|oddany\w*\s+do\s+uzytku|z\s+roku)"
+        r"\D{0,30}\b(19[4-9]\d|20[0-2]\d)\b",
+        re.IGNORECASE,
+    )
 
     CONDITION_KEYWORDS: list[tuple[PropertyCondition, tuple[str, ...]]] = [
         (PropertyCondition.TO_RENOVATE, ("do remontu", "generalny remont", "wymaga remontu")),
@@ -19,6 +24,11 @@ class Scraper:
     ]
 
     def extract_year_built(self, text: str) -> int | None:
+        contextual = [int(match.group(1)) for match in self.YEAR_BUILT_PATTERN.finditer(text)]
+        plausible_contextual = [year for year in contextual if 1940 <= year <= 2026]
+        if plausible_contextual:
+            return plausible_contextual[0]
+
         matches = [int(match.group(1)) for match in self.YEAR_PATTERN.finditer(text)]
         plausible = [year for year in matches if 1940 <= year <= 2026]
         return plausible[0] if plausible else None

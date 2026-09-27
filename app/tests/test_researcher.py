@@ -4,7 +4,14 @@ import asyncio
 from types import SimpleNamespace
 
 from app.agents.researcher import Researcher
-from app.models import GraphState, MarketType, OfferAvailability, UserCriteria, WorkflowStatus
+from app.models import (
+    GraphState,
+    MarketType,
+    OfferAvailability,
+    PropertyOffer,
+    UserCriteria,
+    WorkflowStatus,
+)
 from app.tools.scraper import Scraper
 
 
@@ -84,8 +91,10 @@ class FakeActiveDetailPageTool:
             {
                 "type": "text",
                 "text": (
-                    "Oferta aktualna. Dom wolnostojacy Otwock, powierzchnia 190 m2, "
-                    "cena 1 390 000 zl. Rok budowy 2010, stan bardzo dobry, "
+                    "Oferta aktualna. Cena za metr: 7 315 PLN/m2. "
+                    "Dom wolnostojacy Otwock, powierzchnia uzytkowa 190 m2, "
+                    "cena 1 390 000 zl. 900 m do stacji PKP Otwock. "
+                    "Rok budowy 2010, stan bardzo dobry, "
                     "rynek wtorny. Kontakt do sprzedajacego."
                 ),
             }
@@ -186,7 +195,37 @@ def test_researcher_marks_offer_active_when_source_page_confirms_it() -> None:
     assert offers[0].availability_source == "source_page"
     assert offers[0].price_pln == 1_390_000
     assert offers[0].area_m2 == 190
+    assert offers[0].price_per_m2 == 7315.79
+    assert offers[0].listing_station == "Otwock"
     assert offers[0].year_built == 2010
+
+
+def test_researcher_leaves_station_empty_when_source_page_has_no_station() -> None:
+    researcher = Researcher.__new__(Researcher)
+    researcher.scraper = Scraper()
+    offer = PropertyOffer(
+        title="Dom Otwock",
+        price_pln=1_100_000,
+        area_m2=120,
+        address="Otwock",
+        municipality="Otwock",
+        listing_station="Otwock",
+        link="https://example-real-estate.pl/oferta/dom-otwock-no-station",
+    )
+
+    researcher._enrich_offer_from_source_page(
+        offer,
+        (
+            "Oferta aktualna. Dom wolnostojacy Otwock, powierzchnia uzytkowa 125 m2, "
+            "cena 1 200 000 zl. Rok budowy 2018, stan bardzo dobry."
+        ),
+        UserCriteria(max_price_pln=2_500_000),
+    )
+
+    assert offer.price_pln == 1_200_000
+    assert offer.area_m2 == 125
+    assert offer.listing_station is None
+    assert offer.year_built == 2018
 
 
 def test_researcher_drops_inactive_source_page_offers() -> None:

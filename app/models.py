@@ -93,6 +93,7 @@ class PropertyOffer(BaseModel):
     address: str
     municipality: str
     district: str | None = None
+    listing_station: str | None = None
     link: str
     description: str = ""
     photos: list[str] = Field(default_factory=list)

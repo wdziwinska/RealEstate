@@ -125,17 +125,17 @@ def offer_rows(
                 "tytuł": offer.title,
                 "adres": offer.address,
                 "gmina/dzielnica": f"{offer.municipality} {offer.district or ''}".strip(),
-                "cena": _format_pln(offer.price_pln),
-                "m2": _format_number(offer.area_m2),
-                "PLN/m2": _format_pln(offer.price_per_m2),
+                "Cena": _format_pln(offer.price_pln),
+                "m\u00b2": _format_number(offer.area_m2),
+                "PLN/m\u00b2": _format_pln(offer.price_per_m2),
                 "rynek": offer.market_type.value,
                 "aktualnosc": offer.availability_status.value,
                 "filtry": _filter_match_label(offer, criteria, logistics),
-                "rok": str(offer.year_built) if offer.year_built is not None else "Unknown",
+                "Rok": offer.year_built if offer.year_built is not None else None,
                 "stan": offer.condition.value,
                 "PKP km": logistics.station_distance_km if logistics else None,
-                "stacja": logistics.nearest_station if logistics else None,
-                "dojazd szczyt min": logistics.rush_hour_transit_minutes if logistics else None,
+                "Stacja": getattr(offer, "listing_station", None) or None,
+                "Dojazd szczyt min": None,
                 "benchmark %": market.deviation_pct if market else None,
                 "legal": legal.risk_level.value if legal else None,
                 "środowisko": environmental.overall_score if environmental else None,
@@ -172,6 +172,27 @@ OFFER_LINK_COLUMN = {
         validate=r"^https?://.+",
     )
 }
+
+
+def render_offer_table(
+    title: str,
+    state: GraphState,
+    criteria: UserCriteria,
+    shortlist_only: bool = False,
+) -> None:
+    rows = offer_rows(state, criteria, shortlist_only=shortlist_only)
+    st.subheader(title)
+    st.caption("Aktywne filtry: " + criteria_filter_summary(criteria))
+    if not rows:
+        st.info("Brak ofert spe\u0142niaj\u0105cych aktywne filtry.")
+        return
+
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config=OFFER_LINK_COLUMN,
+    )
 
 
 def render_costs(state: GraphState) -> None:
@@ -276,24 +297,10 @@ def main() -> None:
     render_costs(state)
 
     if state.offers:
-        st.subheader("Discovery")
-        st.caption("Aktywne filtry: " + criteria_filter_summary(criteria))
-        st.dataframe(
-            offer_rows(state, criteria),
-            hide_index=True,
-            width="stretch",
-            column_config=OFFER_LINK_COLUMN,
-        )
+        render_offer_table("Discovery", state, criteria)
 
     if state.shortlist:
-        st.subheader("Shortlista po filtrze PKP")
-        st.caption("Aktywne filtry: " + criteria_filter_summary(criteria))
-        st.dataframe(
-            offer_rows(state, criteria, shortlist_only=True),
-            hide_index=True,
-            width="stretch",
-            column_config=OFFER_LINK_COLUMN,
-        )
+        render_offer_table("Shortlista po filtrze PKP", state, criteria, shortlist_only=True)
 
     if state.status == WorkflowStatus.HITL_WAITING:
         st.subheader("Checkpoint HITL")
@@ -333,7 +340,7 @@ def main() -> None:
                     "tytuł": item.title,
                     "score": item.score,
                     "cena": _format_pln(item.price_pln),
-                    "PLN/m2": _format_pln(item.price_per_m2),
+                    "PLN/m\u00b2": _format_pln(item.price_per_m2),
                     "uzasadnienie": item.summary,
                 }
                 for item in state.final_ranking

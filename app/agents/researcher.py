@@ -32,21 +32,55 @@ SEARCH_RESULT_PATTERN = re.compile(
     re.DOTALL,
 )
 
-PRICE_PATTERN = re.compile(
-    r"(?P<amount>\d{1,3}(?:[\s\u00a0]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)\s*"
-    r"(?P<currency>zł|zl|pln)",
-    re.IGNORECASE,
-)
-MILLION_PRICE_PATTERN = re.compile(
-    r"(?P<amount>\d+(?:[,.]\d+)?)\s*(?:mln|milion(?:a|y|ow)?)\s*(?:zł|zl|pln)?",
-    re.IGNORECASE,
-)
-AREA_PATTERN = re.compile(r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m²|m\^2)", re.IGNORECASE)
-
 PRICE_LABEL_PATTERN = re.compile(
     r"(?:cena|price)\D{0,30}"
     r"(?P<amount>\d{1,3}(?:[\s\u00a0]\d{3})+(?:[,.]\d{1,2})?)",
     re.IGNORECASE,
+)
+
+PRICE_PATTERN = re.compile(
+    r"(?P<amount>\d{1,3}(?:[\s\u00a0]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)\s*"
+    r"(?P<currency>z\u0142|zl|pln)",
+    re.IGNORECASE,
+)
+MILLION_PRICE_PATTERN = re.compile(
+    r"(?P<amount>\d+(?:[,.]\d+)?)\s*(?:mln|milion(?:a|y|ow)?)\s*(?:z\u0142|zl|pln)?",
+    re.IGNORECASE,
+)
+AREA_PATTERN = re.compile(
+    r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m\u00b2|m\^2)",
+    re.IGNORECASE,
+)
+AREA_LABEL_PATTERN = re.compile(
+    r"(?:powierzchnia(?:\s+uzytkowa)?|metraz|area)\D{0,50}"
+    r"(?P<area>\d{2,4}(?:[,.]\d+)?)\s*(?:m2|m\u00b2|m\^2)",
+    re.IGNORECASE,
+)
+STATION_PATTERNS = (
+    re.compile(
+        r"\b(?:stacja|stacji|dworzec)\s+(?:pkp|skm|wkd)?\s*(?P<station>[^.,;\n]{2,80})",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:pkp|skm|wkd)\s+(?P<station>[^.,;\n]{2,80})", re.IGNORECASE),
+)
+STATION_TRAILING_CONTEXT_PATTERN = re.compile(
+    r"\b(?:w\s+odleglosci|oddalon\w*|znajduj\w*|dojscie|dojazd|pieszo|okolo|ok\.?|"
+    r"minut\w*|rok\s+budowy|cena|powierzchnia|stan|rynek|kontakt|km|m)\b",
+    re.IGNORECASE,
+)
+STATION_REJECT_PREFIXES = (
+    "w ",
+    "we ",
+    "do ",
+    "od ",
+    "i ",
+    "oraz ",
+    "przy ",
+    "blisko ",
+    "poblizu ",
+    "znajduje ",
+    "znajduja ",
+    "jest ",
 )
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\)\"']+")
@@ -928,6 +962,7 @@ class Researcher:
         offer.district = district
         offer.address = self._address_from_location(municipality, district)
         offer.market_type = self._infer_market_type(source_text, criteria)
+        offer.listing_station = self._extract_listing_station(source_text)
 
         year_built = self.scraper.extract_year_built(source_text)
         if year_built is not None:
@@ -940,12 +975,7 @@ class Researcher:
         offer.description = self._source_page_description(source_text, offer.description)
 
     def _text_has_price(self, text: str) -> bool:
-        normalized = self._normalize(text)
-        return (
-            bool(PRICE_PATTERN.search(text))
-            or bool(PRICE_LABEL_PATTERN.search(text))
-            or bool(MILLION_PRICE_PATTERN.search(normalized))
-        )
+        return self._has_total_price_in_text(text)
 
     def _source_page_description(self, source_text: str, fallback: str) -> str:
         if len(source_text) < max(80, len(fallback)):
@@ -977,11 +1007,7 @@ class Researcher:
         if self._first_marker(normalized_text, ACTIVE_LISTING_MARKERS):
             return True
 
-        has_price = (
-            bool(PRICE_PATTERN.search(text))
-            or bool(PRICE_LABEL_PATTERN.search(text))
-            or bool(MILLION_PRICE_PATTERN.search(normalized_text))
-        )
+        has_price = self._has_total_price_in_text(text)
         has_area = bool(AREA_PATTERN.search(text))
         has_contact_hint = any(
             marker in normalized_text
@@ -1036,6 +1062,7 @@ class Researcher:
             address=self._address_from_location(municipality, district),
             municipality=municipality,
             district=district,
+            listing_station=self._extract_listing_station(listing_text),
             link=link,
             description=description,
             year_built=scraped["year_built"],
@@ -1107,11 +1134,7 @@ class Researcher:
         if any(marker in normalized_link for marker in DETAIL_URL_MARKERS):
             return True
 
-        has_price = (
-            bool(PRICE_PATTERN.search(text))
-            or bool(PRICE_LABEL_PATTERN.search(text))
-            or bool(MILLION_PRICE_PATTERN.search(normalized_text))
-        )
+        has_price = self._has_total_price_in_text(text)
         has_area = bool(AREA_PATTERN.search(text))
         generic_title = any(
             marker in normalized_text
@@ -1156,25 +1179,18 @@ class Researcher:
         warnings: list[str] = []
         normalized = self._normalize(text)
 
-        price_matches = [self._parse_number(match.group("amount")) for match in PRICE_PATTERN.finditer(text)]
-        price_matches = [price for price in price_matches if price is not None and price > 0]
+        price_matches = self._price_candidates_from_pattern(text, PRICE_PATTERN)
 
         if not price_matches:
-            price_matches = [
-                self._parse_number(match.group("amount"))
-                for match in PRICE_PATTERN.finditer(normalized)
-            ]
-            price_matches = [price for price in price_matches if price is not None and price > 0]
+            price_matches = self._price_candidates_from_pattern(normalized, PRICE_PATTERN)
 
         if not price_matches:
-            price_matches = [
-                self._parse_number(match.group("amount"))
-                for match in PRICE_LABEL_PATTERN.finditer(text)
-            ]
-            price_matches = [price for price in price_matches if price is not None and price > 0]
+            price_matches = self._price_candidates_from_pattern(text, PRICE_LABEL_PATTERN)
 
         if not price_matches:
             for match in MILLION_PRICE_PATTERN.finditer(normalized):
+                if self._is_unit_price_context(normalized, match.start(), match.end()):
+                    continue
                 raw_value = match.group("amount").replace(",", ".")
                 try:
                     price_matches.append(int(float(raw_value) * 1_000_000))
@@ -1189,13 +1205,70 @@ class Researcher:
         warnings.append("Price missing in search summary; using criteria max price as fallback.")
         return int(criteria.max_price_pln), warnings
 
+    def _price_candidates_from_pattern(
+        self,
+        text: str,
+        pattern: re.Pattern[str],
+    ) -> list[int]:
+        prices: list[int] = []
+        for match in pattern.finditer(text):
+            if self._is_unit_price_context(text, match.start(), match.end()):
+                continue
+            price = self._parse_number(match.group("amount"))
+            if price is not None and price > 0:
+                prices.append(price)
+        return prices
+
+    def _has_total_price_in_text(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if self._price_candidates_from_pattern(text, PRICE_PATTERN):
+            return True
+        if self._price_candidates_from_pattern(normalized, PRICE_PATTERN):
+            return True
+        if self._price_candidates_from_pattern(text, PRICE_LABEL_PATTERN):
+            return True
+        return any(
+            not self._is_unit_price_context(normalized, match.start(), match.end())
+            for match in MILLION_PRICE_PATTERN.finditer(normalized)
+        )
+
+    def _is_unit_price_context(self, text: str, start: int, end: int) -> bool:
+        before = self._normalize(text[max(0, start - 45) : start])
+        after = self._normalize(text[end : min(len(text), end + 35)])
+        return bool(
+            re.match(r"\s*(?:(?:pln|zl|z\u0142)\s*)?(?:/|za|per)\s*m(?:2|\^2)\b", after)
+            or re.search(
+                r"(?:cena\s*)?(?:za|/|per)\s*(?:m(?:2|\^2)|metr(?:\s+kwadratowy)?)\s*[:\-]?\s*$",
+                before,
+            )
+            or re.search(r"metr\s+kwadratowy\s*$", before)
+            or re.match(r"\s*(?:za\s+)?metr\s+kwadratowy\b", after)
+        )
+
     def _extract_area_m2(
         self,
         text: str,
         criteria: UserCriteria,
         price_pln: int,
     ) -> tuple[float, list[str]]:
-        for match in AREA_PATTERN.finditer(text):
+        for source_text, pattern in (
+            (self._normalize(text), AREA_LABEL_PATTERN),
+            (text, AREA_PATTERN),
+            (self._normalize(text), AREA_PATTERN),
+        ):
+            area = self._area_from_pattern(source_text, pattern)
+            if area is not None:
+                return area, []
+
+        fallback_area = criteria.min_area_m2 or max(60.0, min(280.0, round(price_pln / 10_000, 1)))
+        return fallback_area, ["Area missing in search summary; using estimated fallback."]
+
+    def _area_from_pattern(
+        self,
+        text: str,
+        pattern: re.Pattern[str],
+    ) -> float | None:
+        for match in pattern.finditer(text):
             raw_value = match.group("area").replace(",", ".")
             try:
                 area = float(raw_value)
@@ -1203,10 +1276,33 @@ class Researcher:
                 continue
 
             if area > 0:
-                return area, []
+                return area
 
-        fallback_area = criteria.min_area_m2 or max(60.0, min(280.0, round(price_pln / 10_000, 1)))
-        return fallback_area, ["Area missing in search summary; using estimated fallback."]
+        return None
+
+    def _extract_listing_station(self, text: str) -> str | None:
+        for pattern in STATION_PATTERNS:
+            for match in pattern.finditer(text):
+                station = self._clean_listing_station(match.group("station"))
+                if station:
+                    return station
+        return None
+
+    def _clean_listing_station(self, value: str) -> str | None:
+        station = self._clean_text(value)
+        station = STATION_TRAILING_CONTEXT_PATTERN.split(station, maxsplit=1)[0]
+        station = re.sub(r"\s+\d+(?:[,.]\d+)?\s*$", "", station)
+        station = self._clean_text(station.strip(" -:()[]"))
+        if not station:
+            return None
+
+        normalized = self._normalize(station)
+        if any(normalized.startswith(prefix) for prefix in STATION_REJECT_PREFIXES):
+            return None
+        if not re.search(r"[A-Za-z]", normalized):
+            return None
+
+        return station[:80]
 
     def _infer_location(
         self,
